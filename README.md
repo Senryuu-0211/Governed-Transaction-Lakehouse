@@ -29,8 +29,10 @@ Debezium ──► Kafka (KRaft) ──► Spark Structured Streaming
                         Airflow (orchestration)  ·  Prometheus/Grafana/Loki (observability)
 ```
 
-**Cloud-portable by design:** all storage access goes through the **S3 API** against MinIO.
-Part 2 swaps the endpoint to real AWS S3 (+ Glue + Athena) with **no code rewrite**.
+**On-premise now, cloud-ready by design:** the whole stack runs locally at $0 (MinIO speaks S3).
+Because all storage access goes through the **S3 API**, moving to the cloud (AWS S3 + Glue +
+Athena) is an endpoint change with **no code rewrite** — one codebase serves both on-premise and
+cloud, with no vendor lock-in.
 
 ---
 
@@ -98,6 +100,21 @@ Inspect topics/messages in Kafka UI at `localhost:8092`.
 
 ---
 
+## CDC operational safety
+
+Two mechanisms that separate "operated CDC in production" from "followed a tutorial":
+
+- **Replication-slot protection.** Debezium holds a replication slot, so Postgres cannot recycle
+  un-consumed WAL — a stalled or dead consumer could fill the source disk and crash the core DB.
+  `max_slot_wal_keep_size=10GB` invalidates a lagging slot (recoverable via re-snapshot) instead
+  of filling disk: **sacrifice the pipeline before the source system.** Slot lag (`retained_wal`)
+  is the **#1 metric to monitor** — ahead of consumer lag (Phase 5).
+- **Only committed transactions reach Bronze.** Debezium reads via **logical decoding** (not raw
+  WAL), so it emits only committed changes, in commit order; rolled-back transactions never appear.
+  Bronze is clean by construction — no in-flight/dirty rows to filter out.
+
+---
+
 ## Quick start (Step 1a)
 
 ```bash
@@ -126,6 +143,18 @@ issues/                       # tracked design issues / follow-ups
 See [`docs/design-notes.md`](docs/design-notes.md) for the **ingestion pattern**, **delivery
 semantics** (why at-least-once), and the **idempotency / dedup strategy** that makes each
 transaction count exactly once without chasing exactly-once delivery.
+
+## Design philosophy & planned extensions
+
+A governed data platform must serve **decision-makers, not just the data team** — governance only
+has value when a non-technical user can answer *"what is this table, where's it from, can I trust
+it?"* through a UI. Planned once the core (Phase 1–4) is solid:
+
+- **Lineage visualization** for business users — DataHub / OpenMetadata (rich discovery, heavier),
+  or lightweight OpenLineage + Marquez (native to Airflow/Spark/dbt).
+- **AI year-end report** — an LLM writes the *narrative* around numbers that are **computed and
+  fixed by code** (the LLM never touches the numbers; charts are code-rendered). Hallucination-safe
+  by construction — essential for financial figures.
 
 ## Notes
 - Postgres init scripts run only on an **empty volume** — changing schema needs `docker compose down -v`.
