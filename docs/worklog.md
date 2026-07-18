@@ -4,6 +4,41 @@ Nhật ký để resume nhanh sau khi context bị nén. Mới nhất ở trên.
 
 ---
 
+## 18-07-2026
+
+### Chốt phiên
+- **1b verified ĐẦY ĐỦ end-to-end** (đã sửa overclaim của entry 13-07): bắt tận mắt envelope
+  `op=c` (before=null→PENDING), `op=u` (PENDING→COMPLETED, before-image), `op=d` (before + after=null
+  + tombstone). `amount` là string (decimal.handling.mode). `verify_1b.sh` 10/10.
+- **Slot protection set NGAY**: `max_slot_wal_keep_size=10GB` vào Postgres command (recreate, không mất data).
+  Slot khỏe (retained_wal ~1MB). → bảo vệ core DB từ dev.
+
+### Review PLAN update (V2 delta) — đã đồng bộ vào CẢ 3 file (CLAUDE.md, PLAN_V2, README)
+- **CDC operational risks**: (1) replication slot có thể đầy đĩa→sập core DB (4 lớp bảo vệ, slot-lag
+  = metric hạng nhất); (2) logical decoding chỉ phát txn đã commit (Bronze tự sạch).
+- **Ext1** lineage viz (DataHub/OpenMetadata primary, có ES→on-demand; alt OpenLineage+Marquez nhẹ) —
+  chốt ở Ext1 sau khi đo RAM. **Ext2** Gemini report (4 guard: LLM không chạm số + chart code vẽ +
+  validate output + data-residency). Cả 2 CHỈ làm sau core Phase 1-4.
+- **Philosophy #5/#6**: data platform phục vụ business/phòng ban, không chỉ team data.
+
+### Privacy (QUAN TRỌNG)
+- **BỎ HẲN** framing tên tổ chức/quốc gia mục tiêu + đơn vị tiền vùng đó khỏi MỌI file (kể cả private).
+  Framing giờ trung tính: **"on-premise + cloud"** (code S3 API → chạy local $0, đổi endpoint lên cloud AWS-ready).
+- History GitHub đã scrub sạch (orphan-squash + force-push). Currency = **USD**.
+- `.gitignore` chặn `PLAN_*.md`, `BANKING_PROJECT_*`, `CLAUDE_BANKING*`, `.claude/`, `CLAUDE.md`, `.env`.
+
+### RAM investigation (kết luận: KHÔNG có vấn đề)
+- Thật: **used ~8.5G / 46G, available 37G**. Không gần 48GB (cảnh báo "vượt 48GB" trước là NÓI QUÁ —
+  do cộng LIMIT chứ không phải usage).
+- Airflow "ngốn RAM" (docker stats 3.36G/4.8G) = **kernel slab_reclaimable (dentry/inode cache)**,
+  reclaimable, KHÔNG leak. RSS thật: worker 1.57G, triggerer 0.6G. Nguồn: uptime 10 ngày + file ops (không phải log — log chỉ 77M).
+- Peak dự kiến full Phase 1-4 ~20-25G. Chỉ DataHub(ES) + Spark 2 job đồng thời mới đẩy sát trần → đã phòng (reuse Spark + on-demand DataHub).
+
+### Repo state
+main sạch (2 commit: `e0ca946` core 1a+1b, `3861bc5` README). PLAN_V2/CLAUDE.md/.env private (không lên GitHub).
+
+---
+
 ## 13-07-2026
 
 ### Trạng thái tổng
