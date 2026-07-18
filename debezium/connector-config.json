@@ -1,0 +1,32 @@
+{
+  "name": "gtl-postgres-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "debezium",
+    "database.password": "__FROM_ENV__",
+    "database.dbname": "banking",
+
+    "topic.prefix": "gtl",
+    "plugin.name": "pgoutput",
+
+    "slot.name": "debezium_slot",
+    "publication.name": "dbz_publication",
+    "publication.autocreate.mode": "disabled",
+
+    "table.include.list": "public.accounts,public.merchants,public.transactions",
+    "snapshot.mode": "initial",
+    "tombstones.on.delete": "true",
+
+    "decimal.handling.mode": "string",
+    "time.precision.mode": "connect",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter.schemas.enable": "false"
+  }
+}

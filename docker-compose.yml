@@ -1,0 +1,157 @@
+name: governed-txn-lakehouse
+
+# =============================================================================
+# Phase 1 — Step 1a: Postgres source (logical replication) + data faker.
+# CHƯA có Debezium/Kafka/Spark — đây chỉ là NGUỒN mà CDC sẽ đọc ở Step 1b.
+# =============================================================================
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: gtl-postgres
+    # ---- Logical replication (nền của CDC không mất event) ----
+    # Debezium (Step 1b) đọc Write-Ahead Log qua 1 logical replication slot để bắt
+    # MỌI thay đổi hàng (INSERT/UPDATE/DELETE) theo đúng thứ tự commit. Không có
+    # wal_level=logical thì không có logical decoding -> CDC bất khả thi.
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_wal_senders=4"        # >=1 mỗi kết nối replication; dư cho Debezium + thử nghiệm
+      - "-c"
+      - "max_replication_slots=4"  # slot CDC cần persistence; dư vài slot để test
+      # CDC RISK #1: nếu slot tụt quá 10GB WAL, Postgres INVALIDATE slot (hy sinh CDC,
+      # re-snapshot được) thay vì để đầy đĩa làm SẬP core DB. Thà mất CDC còn hơn sập DB.
+      - "-c"
+      - "max_slot_wal_keep_size=10GB"
+    environment:
+      # Lấy từ .env (không hardcode secret vào file versioned).
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # Dùng bởi init script 02_cdc_role.sh để tạo role Debezium với mật khẩu từ .env.
+      DEBEZIUM_PASSWORD: ${DEBEZIUM_PASSWORD}
+    ports:
+      - "5433:5432"   # 5432 thường bận (Postgres Airflow) -> source bank expose 5433
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # init/*.sql chỉ chạy khi volume TRỐNG. Đổi schema -> `down -v` rồi `up`.
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bank -d banking"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 1G   # demo nhỏ; server 48GB đã đông nên đặt limit mọi service
+    restart: unless-stopped
+
+  faker:
+    build: ./faker
+    container_name: gtl-faker
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"          # trong network dùng cổng nội bộ 5432 (5433 chỉ là map ra host)
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+      TXN_RATE: ${TXN_RATE}       # INSERT/giây mục tiêu (từ .env)
+      RANDOM_SEED: ${RANDOM_SEED} # seed để data tái lập được (reconciliation test)
+    depends_on:
+      postgres:
+        condition: service_healthy   # đợi Postgres healthy mới bơm
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    restart: unless-stopped
+
+  # ---- Kafka KRaft (single broker, KHÔNG ZooKeeper) --------------------------
+  # KRaft bỏ hẳn ZooKeeper (metadata do chính Kafka quản qua raft). Single broker
+  # đủ cho demo; deploy thật dùng multi-broker/MSK. Broker vừa là controller vừa broker.
+  kafka:
+    image: apache/kafka:3.8.1
+    container_name: gtl-kafka
+    hostname: kafka
+    ports:
+      - "9093:9093"   # EXTERNAL listener cho tool ở host; nội bộ dùng kafka:9092
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9095
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9095,EXTERNAL://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Single broker -> mọi replication factor = 1 (không có broker khác để nhân bản).
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    restart: unless-stopped
+
+  # ---- Kafka Connect + Debezium (Postgres connector) ------------------------
+  # Image Debezium đã bundle sẵn connector Postgres. Connect chạy connector, đọc WAL
+  # qua role debezium (least-privilege) và publish change event lên Kafka topic.
+  connect:
+    image: quay.io/debezium/connect:2.7
+    container_name: gtl-connect
+    hostname: connect
+    ports:
+      - "8083:8083"   # Connect REST API (đăng ký/giám sát connector)
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: gtl-connect
+      CONFIG_STORAGE_TOPIC: _connect_configs
+      OFFSET_STORAGE_TOPIC: _connect_offsets
+      STATUS_STORAGE_TOPIC: _connect_status
+      # Single broker -> RF=1 cho các topic nội bộ của Connect.
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+    depends_on:
+      kafka:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    restart: unless-stopped
+
+  # ---- Kafka UI (soi topic/message) -----------------------------------------
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: gtl-kafka-ui
+    ports:
+      - "8092:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: gtl
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://connect:8083
+      DYNAMIC_CONFIG_ENABLED: "true"
+    depends_on:
+      kafka:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  kafka-data:

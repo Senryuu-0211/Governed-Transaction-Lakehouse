@@ -1,0 +1,134 @@
+# Governed Transaction Lakehouse
+
+A near-real-time banking transaction pipeline and **governed lakehouse**, built
+correctness-first and governance-first. It captures every transaction change via
+**Change Data Capture (CDC)** with no lost events, lands it in an **ACID lakehouse**
+with audit and time-travel, and enforces data quality, lineage, and PII controls.
+
+> **Designed for bank-scale, demoed at small scale — and the boundary is stated explicitly.**
+> The architecture is built to scale to billions of transactions; the demo runs at a modest
+> rate on a single host. Where a choice is "designed to scale to X" vs "demo runs at Y", the
+> code says so.
+
+---
+
+## Architecture (Part 1 — fully local, $0)
+
+```
+Postgres (CDC source)
+   │  logical replication (WAL)
+   ▼
+Debezium ──► Kafka (KRaft) ──► Spark Structured Streaming
+                                   │  Debezium envelope (op/before/after)
+                                   ▼
+                        Bronze  ──►  Silver  ──►  Gold      (Apache Iceberg on MinIO / S3 API)
+                        (raw CDC)   (clean+PII)  (star schema)
+                                   │
+                        governance (dbt tests · lineage · reconciliation · PII masking)
+                                   │
+                        Airflow (orchestration)  ·  Prometheus/Grafana/Loki (observability)
+```
+
+**Cloud-portable by design:** all storage access goes through the **S3 API** against MinIO.
+Part 2 swaps the endpoint to real AWS S3 (+ Glue + Athena) with **no code rewrite**.
+
+---
+
+## Tech stack (and why, not just what)
+
+| Layer | Tool | Rationale |
+|---|---|---|
+| Source OLTP | **PostgreSQL 16** (`wal_level=logical`) | Clean logical-replication slot for CDC |
+| CDC | **Debezium** | Reads the WAL — captures INSERT/UPDATE/**DELETE** in commit order; timestamp-polling misses deletes |
+| Log / streaming bus | **Kafka (KRaft)** | Industry standard (MSK); KRaft removes ZooKeeper |
+| Stream + batch compute | **Apache Spark** | Scales past single-machine RAM to bank-size data |
+| Transform modelling | **dbt** (dbt-spark) | Structure, tests, docs, lineage over Spark execution |
+| Lake storage | **MinIO** (S3 API) | S3-compatible → one endpoint change to reach AWS S3 |
+| Table format | **Apache Iceberg** | ACID, time-travel (audit), schema evolution, engine-agnostic |
+| Catalog | **Iceberg REST** → Glue (Part 2) | |
+| Orchestration | **Airflow** (LocalExecutor) | |
+| Observability | **Prometheus + Grafana + Loki** | |
+
+**Correctness rules baked in:** money is `DECIMAL`, never float; `FAILED` transactions are not
+real money; `REVERSED` transactions are never double-counted; Bronze total reconciles to Gold
+each run.
+
+---
+
+## Roadmap
+
+| Phase | Goal |
+|---|---|
+| **1 — CDC pipeline** | CDC flows end-to-end → Bronze Iceberg captures INSERT/UPDATE/DELETE |
+| 2 — Medallion transform | Gold star schema + dbt structural tests (quality as a gate), correct REVERSAL |
+| 3 — Orchestration | Airflow-driven, idempotent, backfillable |
+| 4 — Advanced governance | Time-travel audit, lineage, reconciliation, Great Expectations, PII masking |
+| 5 — Observability | Lag/freshness dashboards + alerting |
+| 6 — CI/CD + LocalStack | Automated deploy; cloud code runs $0 on LocalStack |
+| Part 2 — Real AWS | S3 + Glue + Athena (endpoint swap) |
+
+---
+
+## Status
+
+- ✅ **Phase 1 · Step 1a** — Postgres source + logical replication + data faker
+- ✅ **Phase 1 · Step 1b** — Debezium + Kafka KRaft (CDC → topics)
+- ⬜ Phase 1 · Step 1c — Spark Streaming → Bronze Iceberg on MinIO (S3 API)
+
+### Step 1a highlights
+- `wal_level=logical` with replication slots ready for Debezium
+- Schema: `accounts` (PII-tagged), `transactions` (money `DECIMAL`, status lifecycle
+  `PENDING → COMPLETED/FAILED → REVERSED`), `merchants`; `REPLICA IDENTITY FULL` for CDC before-images
+- **Least-privilege CDC role** (`REPLICATION` + `SELECT` only) with a scoped publication
+- `updated_at` maintained by a DB trigger; secrets kept in `.env` (never committed)
+- Faker mixes INSERT + status UPDATE + REVERSAL and mutates balances on completion
+
+### Step 1b highlights
+- **Kafka KRaft** single broker (no ZooKeeper); **Kafka Connect + Debezium** Postgres connector
+- Connector uses the least-privilege `debezium` role + pre-created `dbz_publication` (autocreate disabled)
+- `pgoutput` plugin; one topic per table (`gtl.public.*`); versioned connector config, idempotent registration
+- **`decimal.handling.mode=string`** — money stays exact through Kafka (never float)
+- **CDC safety:** `max_slot_wal_keep_size=10GB` — a lagging replication slot gets invalidated
+  instead of filling disk and crashing the source DB (slot-lag = the #1 metric to watch, Phase 5)
+- Verified full Debezium envelope: `r` (snapshot), `c` (insert), `u` (update with before/after
+  status), `d` (delete with before + null after + tombstone)
+
+Run: `docker compose up -d --build` → `bash scripts/register-connector.sh` → `bash scripts/verify_1b.sh`.
+Inspect topics/messages in Kafka UI at `localhost:8092`.
+
+---
+
+## Quick start (Step 1a)
+
+```bash
+cp .env.example .env          # set credentials
+docker compose up -d --build  # Postgres + faker
+docker compose ps             # postgres healthy, faker up
+
+bash scripts/verify.sh        # automated 11-point checkpoint (exit != 0 on failure)
+```
+
+Source DB: `postgresql://<user>@localhost:5433/banking`
+
+---
+
+## Repo layout
+
+```
+docker-compose.yml            # Step 1a stack (Postgres + faker)
+postgres/init/                # 01_schema.sql · 02_cdc_role.sh (runs on empty volume)
+faker/                        # synthetic transaction generator (never real PII)
+scripts/verify.sh             # automated checkpoint
+issues/                       # tracked design issues / follow-ups
+```
+
+## Design notes
+See [`docs/design-notes.md`](docs/design-notes.md) for the **ingestion pattern**, **delivery
+semantics** (why at-least-once), and the **idempotency / dedup strategy** that makes each
+transaction count exactly once without chasing exactly-once delivery.
+
+## Notes
+- Postgres init scripts run only on an **empty volume** — changing schema needs `docker compose down -v`.
+- `down -v` deletes data; confirm you're on the throwaway/test host first.
+- Ports are tracked in `issues/PORTS.md`.
+- Synthetic data only (Faker) — no real personal data anywhere.

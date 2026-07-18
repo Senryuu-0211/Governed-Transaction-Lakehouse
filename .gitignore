@@ -1,0 +1,17 @@
+# secrets / local env
+.env
+*.env.local
+
+# tài liệu nội bộ (không public) — dùng README.md để giới thiệu ra ngoài
+.claude/
+CLAUDE.md
+PLAN_*.md
+BANKING_PROJECT_*.md
+CLAUDE_BANKING*.md
+
+# python
+__pycache__/
+*.pyc
+
+# data / temp
+*.log
