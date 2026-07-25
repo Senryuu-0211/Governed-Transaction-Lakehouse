@@ -1,0 +1,157 @@
+version: 2
+
+# =============================================================================
+# SILVER CONTRACTS — viết TRƯỚC model SQL (tests là hợp đồng data, gác cổng build).
+# Silver = current-state: MỖI primary key ĐÚNG MỘT dòng, bản mới nhất.
+# Nguồn xoá dòng -> soft-delete (is_deleted=true), không mất dấu vết audit.
+# PII bị mask NGAY TẠI ĐÂY — analyst chỉ chạm tầng này trở lên.
+# =============================================================================
+
+models:
+  - name: transactions
+    description: >
+      Current state of every transaction the source has ever emitted — one row per
+      txn_id, collapsed from the Bronze CDC log by latest Kafka offset. Retention-purged
+      FAILED rows are kept with is_deleted=true (soft delete) so the audit trail never
+      loses a row that once existed. NOT financial truth by itself: COMPLETED is real
+      money, FAILED never moved money, REVERSED was undone — Gold applies those rules.
+    columns:
+      - name: txn_id
+        description: Transaction primary key from the source system.
+        data_tests: [unique, not_null]
+      - name: account_id
+        description: Originating account (FK to silver.accounts).
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('accounts')
+              field: account_id
+      - name: merchant_id
+        description: Merchant involved (FK to silver.merchants).
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('merchants')
+              field: merchant_id
+      - name: amount
+        description: >
+          Transaction amount as DECIMAL(15,2). Traveled the whole pipeline as a string
+          (decimal.handling.mode=string) and is cast exactly once, here — money never
+          touches a float.
+        data_tests: [not_null]
+      - name: currency
+        description: ISO currency code (demo emits USD only).
+        data_tests:
+          - accepted_values: { values: ["USD"] }
+      - name: txn_type
+        description: "Money direction: CREDIT = in, DEBIT/TRANSFER = out."
+        data_tests:
+          - accepted_values: { values: ["CREDIT", "DEBIT", "TRANSFER"] }
+      - name: status
+        description: >
+          Lifecycle: PENDING (intent recorded, no money moved yet) -> COMPLETED (real
+          money) / FAILED (no money) -> REVERSED (undone; must never be double-counted).
+          Long-lived PENDING = in-doubt transaction awaiting ops attention.
+        data_tests:
+          - not_null
+          - accepted_values: { values: ["PENDING", "COMPLETED", "FAILED", "REVERSED"] }
+      - name: channel
+        description: Where the transaction was initiated.
+        data_tests:
+          - accepted_values: { values: ["ATM", "POS", "ONLINE", "MOBILE", "BRANCH"] }
+      - name: created_at
+        description: When the source system recorded the transaction.
+        data_tests: [not_null]
+      - name: updated_at
+        description: Last source-side change (maintained by a DB trigger).
+      - name: is_deleted
+        description: >
+          TRUE when the source hard-deleted the row (retention purge of old FAILED
+          transactions). Kept for audit; Gold excludes these.
+        data_tests: [not_null]
+      - name: deleted_at
+        description: Source commit time of the delete event (NULL unless is_deleted).
+      - name: _source_ts_ms
+        description: "Lineage metadata: source commit timestamp (ms) of the applied event."
+      - name: _kafka_offset
+        description: >
+          "Lineage metadata: Kafka offset of the applied event. Also the incremental
+          high-watermark — single-partition topics make offset order = commit order."
+        data_tests: [not_null]
+      - name: _silver_updated_at
+        description: "Lineage metadata: when dbt last touched this row."
+
+  - name: accounts
+    description: >
+      Current state of customer accounts with PII PROTECTED — the only account view an
+      analyst may touch. Three masking techniques, chosen per field: hash (join-able,
+      irreversible), partial mask (recognisable to support staff, useless to a thief),
+      generalize (analytics-grade age without birth date). Raw PII exists only in
+      restricted Bronze.
+    columns:
+      - name: account_id
+        description: Account primary key.
+        data_tests: [unique, not_null]
+      - name: customer_name_hash
+        description: SHA-256 of customer name — distinct-countable, never reversible.
+        data_tests: [not_null]
+      - name: national_id_hash
+        description: SHA-256 of national ID. Highest-sensitivity field, never partial-masked.
+        data_tests: [not_null]
+      - name: phone_masked
+        description: "Partial mask: first 3 + last 2 characters visible (e.g. 090*****23)."
+      - name: email_masked
+        description: "Partial mask: first 2 chars of local part + full domain (e.g. ng***@gmail.com)."
+      - name: birth_year
+        description: Generalized from date_of_birth — age analytics without a birthday.
+      - name: account_type
+        data_tests:
+          - accepted_values: { values: ["SAVINGS", "CHECKING", "CREDIT"] }
+        description: Product type of the account.
+      - name: balance
+        description: >
+          Current balance DECIMAL(15,2). Mutates on every COMPLETED transaction, so this
+          dimension changes at near-fact velocity (why accounts CDC volume is high).
+        data_tests: [not_null]
+      - name: created_at
+        description: Account opening time.
+      - name: is_deleted
+        description: Soft-delete flag (accounts are never purged in the demo; always false).
+        data_tests: [not_null]
+      - name: _source_ts_ms
+        description: "Lineage metadata: source commit timestamp of the applied event."
+      - name: _kafka_offset
+        description: "Lineage metadata + incremental high-watermark."
+        data_tests: [not_null]
+      - name: _silver_updated_at
+        description: "Lineage metadata: when dbt last touched this row."
+
+  - name: merchants
+    description: >
+      Current state of merchants — small, nearly-static dimension (name, category, city).
+    columns:
+      - name: merchant_id
+        description: Merchant primary key.
+        data_tests: [unique, not_null]
+      - name: merchant_name
+        description: Merchant display name (synthetic).
+        data_tests: [not_null]
+      - name: category
+        description: Spend category used by Gold for per-category aggregates.
+        data_tests:
+          - accepted_values:
+              values: ["Grocery", "Fuel", "Dining", "Retail", "Utilities", "Travel", "Health"]
+      - name: city
+        description: Merchant city (synthetic).
+      - name: created_at
+        description: When the merchant was registered.
+      - name: is_deleted
+        description: Soft-delete flag (never true in the demo).
+        data_tests: [not_null]
+      - name: _source_ts_ms
+        description: "Lineage metadata: source commit timestamp of the applied event."
+      - name: _kafka_offset
+        description: "Lineage metadata + incremental high-watermark."
+        data_tests: [not_null]
+      - name: _silver_updated_at
+        description: "Lineage metadata: when dbt last touched this row."

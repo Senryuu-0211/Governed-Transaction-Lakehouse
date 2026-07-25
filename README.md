@@ -75,7 +75,13 @@ each run.
 
 - ✅ **Phase 1 · Step 1a** — Postgres source + logical replication + data faker
 - ✅ **Phase 1 · Step 1b** — Debezium + Kafka KRaft (CDC → topics)
-- ⬜ Phase 1 · Step 1c — Spark Streaming → Bronze Iceberg on MinIO (S3 API)
+- ✅ **Phase 1 · Step 1c** — Spark Structured Streaming → Bronze Iceberg on MinIO (S3 API)
+- ✅ **Phase 2** — Medallion transform on **dbt-on-Spark**: Silver current-state (typed, PII-masked,
+  soft-delete), Gold Kimball star schema, 71 dbt tests as a gate, lineage docs; **Superset**
+  dashboards over a Postgres serving copy of the marts
+- ✅ **Phase 2.5** — **Schema Registry (Avro)**: Debezium emits Avro through Apicurio; incompatible
+  source schema changes are **rejected at the Kafka gate** instead of silently nulling downstream
+- ⬜ Phase 3 — Airflow orchestration (idempotent, backfillable)
 
 ### Step 1a highlights
 - `wal_level=logical` with replication slots ready for Debezium
@@ -98,6 +104,32 @@ each run.
 Run: `docker compose up -d --build` → `bash scripts/register-connector.sh` → `bash scripts/verify_1b.sh`.
 Inspect topics/messages in Kafka UI at `localhost:8092`.
 
+### Step 1c highlights
+
+CDC now lands in an **ACID lakehouse**: three concurrent Spark Structured Streaming queries read
+the Debezium topics into Iceberg tables on MinIO, reached over the **S3 API** — the same code
+path that will address real S3.
+
+- **Bronze mirrors the source, one table per source table.** The fact table is partitioned by
+  ingestion day; the two dimensions are not, because partitioning ~100 rows by day only scatters
+  them into tiny files. Separate tables are also what makes Silver's `MERGE INTO` coherent later:
+  `transactions` keys on `txn_id`, `accounts` on `account_id`.
+- **Bronze stays raw.** The whole Debezium envelope is kept verbatim in one column, with only
+  `op`, source timestamp, and Kafka coordinates lifted out for partitioning and traceability.
+  A source schema change cannot break ingestion, and any disputed figure is traceable to the
+  bytes the source actually emitted. Typing, PII masking, and deduplication belong to Silver.
+- **Independent queries, independent checkpoints** — the busy fact stream cannot stall the
+  dimensions, and any one table can be restarted or backfilled alone.
+- **S3 access through Iceberg's `S3FileIO`** (`iceberg-aws-bundle`) rather than
+  `hadoop-aws` + `aws-java-sdk-bundle`, which removes the Hadoop/AWS SDK version conflict that
+  makes this step fail for most people. Client jars and the REST catalog image are pinned to the
+  same Iceberg version, and a smoke test proves the write path before any stream starts.
+- **Verified end to end:** ~16.9M Bronze rows with `op` values `c`, `u`, **and** `d`, money still
+  exact as a string, and a steady lag of tens of messages behind the source.
+
+Run: `PYTHONPATH=spark python spark/bronze_layer/bronze_stream.py` → `bash scripts/verify_1c.sh`.
+Browse the object store at `localhost:9002`.
+
 ---
 
 ## CDC operational safety
@@ -112,6 +144,15 @@ Two mechanisms that separate "operated CDC in production" from "followed a tutor
 - **Only committed transactions reach Bronze.** Debezium reads via **logical decoding** (not raw
   WAL), so it emits only committed changes, in commit order; rolled-back transactions never appear.
   Bronze is clean by construction — no in-flight/dirty rows to filter out.
+- **Kafka is a buffer with an expiry date, not an archive.** Bronze is the archive — but only if
+  it consumes before retention deletes. This pipeline hit exactly that during development: the
+  broker ran on its 7-day default while capture was live and no durable consumer existed yet, so
+  the oldest change events were dropped, silently. `startingOffsets=earliest` does not save you —
+  "earliest" means the oldest message *still present*, not the oldest ever written. The fix is
+  `retention.ms` sized to **the longest consumer outage worth surviving** (30 days here, measured
+  at ~3 GB/day) plus a `retention.bytes` ceiling, on the same principle as the replication-slot
+  limit: bound the damage. Retention only buys time, though — the real control is **alerting when
+  the consumed offset approaches the oldest available one** (Phase 5, alongside slot lag).
 
 ---
 

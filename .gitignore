@@ -15,3 +15,33 @@ __pycache__/
 
 # data / temp
 *.log
+
+# State cua Iceberg REST catalog (sqlite) - khong commit
+iceberg-catalog/
+
+# Checkpoint cua Spark Structured Streaming (offset state) - khong commit
+_checkpoints/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# dbt artifacts
+dbt_project/target/
+dbt_project/logs/
+dbt_project/dbt_packages/
+
+# JDBC driver binary (mount vao iceberg-rest)
+jars/
+
+# Note rieng tu (review/chien luoc) - khong len GitHub
+issues/OPTIMIZATION.md
+*_PRIVATE.md
+
+CURRENT_STATUS.md
+
+# Spark/Derby local metastore + warehouse (rác tự sinh khi chạy dbt-spark session)
+metastore_db/
+derby.log
+spark-warehouse/
+# dbt user-local (UUID anonymous tracking, máy-riêng)
+dbt_project/.user.yml

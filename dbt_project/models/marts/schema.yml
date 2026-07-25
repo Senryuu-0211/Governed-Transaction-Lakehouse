@@ -1,0 +1,102 @@
+version: 2
+
+# =============================================================================
+# MARTS — bảng tổng hợp phục vụ BI. Sống ở 2 nơi: Iceberg (kho sự thật, dbt build)
+# và bản sao Postgres db `marts` (spark/gold_layer/push_marts.py đẩy sang) cho
+# Superset đọc nhanh. Kỷ luật: mart CHỈ do pipeline sinh; `_refreshed_at` cho
+# business biết số liệu tính đến lúc nào.
+# =============================================================================
+
+models:
+  - name: mart_daily_volume
+    description: >
+      Daily transaction volume — the table behind the main "Transaction Overview"
+      dashboard. One row per calendar day. All money figures are NET (already exclude
+      FAILED/PENDING and reversed money).
+    columns:
+      - name: full_date
+        description: Calendar day.
+        data_tests: [unique, not_null]
+      - name: year
+        description: Calendar year (filter axis).
+      - name: month
+        description: Month number 1-12 (filter axis).
+      - name: month_name
+        description: Month spelled out, for chart labels.
+      - name: day_name
+        description: Weekday spelled out, for chart labels.
+      - name: is_weekend
+        description: TRUE Sat/Sun — weekend vs weekday comparison.
+      - name: txn_count
+        description: Every transaction created that day, regardless of outcome.
+      - name: completed_count
+        description: Transactions where money actually moved.
+      - name: failed_count
+        description: Rejected transactions — no money moved.
+      - name: reversed_count
+        description: Transactions later undone — excluded from net figures.
+      - name: pending_count
+        description: >
+          Still awaiting outcome at build time. A persistently high number signals
+          stuck in-doubt transactions needing ops attention.
+      - name: net_amount
+        description: "THE daily revenue-volume number: sum of real money only."
+        data_tests: [not_null]
+      - name: avg_completed_amount
+        description: Average face value of completed transactions.
+      - name: _refreshed_at
+        description: When the pipeline computed this row — shown on dashboards as data freshness.
+        data_tests: [not_null]
+
+  - name: mart_channel_daily
+    description: Daily volume split by channel — answers "what share of volume is digital".
+    columns:
+      - name: full_date
+        description: Calendar day.
+        data_tests: [not_null]
+      - name: channel
+        description: Channel code (ATM, POS, ONLINE, MOBILE, BRANCH).
+        data_tests: [not_null]
+      - name: is_digital
+        description: TRUE for ONLINE/MOBILE — the digital-share flag.
+      - name: txn_count
+        description: Transactions created that day on this channel.
+      - name: net_amount
+        description: Real money moved that day through this channel.
+      - name: _refreshed_at
+        description: Pipeline compute time (freshness stamp).
+
+  - name: mart_category_daily
+    description: Daily spend by merchant category — "where are customers spending".
+    columns:
+      - name: full_date
+        description: Calendar day.
+        data_tests: [not_null]
+      - name: category
+        description: Merchant spend category (Grocery, Fuel, Dining, …).
+        data_tests: [not_null]
+      - name: txn_count
+        description: Transactions created that day in this category.
+      - name: net_amount
+        description: Real money moved that day in this category.
+      - name: _refreshed_at
+        description: Pipeline compute time (freshness stamp).
+
+exposures:
+  - name: transaction_overview_dashboard
+    label: "Transaction Overview (Superset)"
+    type: dashboard
+    maturity: medium
+    url: http://localhost:8088
+    description: >
+      Business-facing Superset dashboard on the Postgres copy of these marts:
+      daily net volume, status breakdown, digital share, category spend, and a
+      freshness stamp from _refreshed_at. Declared as a dbt exposure so lineage
+      runs source → Bronze → Silver → Gold → mart → dashboard end to end.
+    depends_on:
+      - ref('mart_daily_volume')
+      - ref('mart_channel_daily')
+      - ref('mart_category_daily')
+    owner:
+      name: Senryuu
+      email: nguyentk0211@gmail.com

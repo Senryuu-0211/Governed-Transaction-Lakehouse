@@ -1,0 +1,27 @@
+# dbt project — tầng transform (Silver/Gold) của Governed Transaction Lakehouse.
+# dbt lo CẤU TRÚC/TESTS/DOCS/LINEAGE; Spark lo execution (adapter dbt-spark, session mode).
+name: "gtl_lakehouse"
+version: "1.0.0"
+config-version: 2
+
+profile: "gtl_lakehouse"
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+analysis-paths: ["analyses"]
+seed-paths: ["seeds"]
+
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  gtl_lakehouse:
+    # Mọi model materialize thành bảng ICEBERG (ACID + time-travel cho audit).
+    +file_format: iceberg
+    silver:
+      +schema: silver
+    gold:
+      +schema: gold
+    marts:
+      +schema: marts
+      +materialized: table

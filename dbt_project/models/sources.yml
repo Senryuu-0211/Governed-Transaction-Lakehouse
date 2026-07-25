@@ -1,0 +1,66 @@
+version: 2
+
+sources:
+  - name: bronze
+    description: >
+      Raw CDC landing layer. Each row is one Debezium change event captured from the
+      source banking database, kept verbatim: the full envelope lives in `value` and only
+      partitioning/traceability fields are lifted out. Append-only, no dedup — Bronze
+      records, Silver interprets. Written continuously by the Spark streaming job
+      (spark/bronze_layer/bronze_stream.py), NOT by dbt.
+    schema: bronze
+    # Freshness đo trên ingest_ts: stream sống thì Bronze phải mới. Quá 15' = warn,
+    # quá 2h = error (stream chết hoặc nguồn ngừng bơm — cả hai đều phải biết).
+    loaded_at_field: ingest_ts
+    freshness:
+      warn_after: { count: 15, period: minute }
+      error_after: { count: 2, period: hour }
+    tables:
+      - name: transactions
+        description: >
+          CDC events for the `transactions` fact table (high volume, partitioned by
+          ingestion day). op=c inserts, op=u status lifecycle + reversals, op=d retention
+          purges of FAILED rows, op=r initial snapshot. Tombstones appear as rows with
+          NULL value.
+        columns: &bronze_columns
+          - name: op
+            description: >
+              Debezium operation: r=snapshot read, c=insert, u=update, d=delete.
+              NULL only for Kafka tombstones (the deletion marker that follows op=d).
+            data_tests:
+              - accepted_values:
+                  values: ["r", "c", "u", "d"]
+          - name: source_ts_ms
+            description: Commit timestamp (ms) in the source database, from the envelope.
+          - name: key
+            description: Kafka message key = JSON of the source row's primary key.
+            data_tests:
+              - not_null
+          - name: value
+            description: >
+              The FULL Debezium envelope, unmodified — the auditable original bytes.
+              NULL only for tombstones.
+          - name: kafka_partition
+            description: Kafka partition (single-partition topics in this demo).
+          - name: kafka_offset
+            description: >
+              Kafka offset — traceability + dedup key + incremental high-watermark for
+              Silver. Within one partition, offset order IS commit order.
+            data_tests:
+              - not_null
+          - name: kafka_ts
+            description: Kafka broker receive timestamp.
+          - name: ingest_ts
+            description: Spark processing time when the row landed in Bronze (partition key).
+            data_tests:
+              - not_null
+      - name: accounts
+        description: >
+          CDC events for `accounts` (dimension, ~100 rows, very high update rate — every
+          COMPLETED transaction mutates balance). Contains RAW PII in the envelope:
+          restricted layer, masked in Silver.
+        columns: *bronze_columns
+      - name: merchants
+        description: >
+          CDC events for `merchants` (small, nearly-static dimension, ~50 rows).
+        columns: *bronze_columns

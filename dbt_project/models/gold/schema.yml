@@ -1,0 +1,153 @@
+version: 2
+
+# =============================================================================
+# GOLD CONTRACTS — star schema Kimball, tầng business đọc.
+# GATE của Phase 2: MỌI cột phải có mô tả NGHIỆP VỤ (người không rành data đọc
+# hiểu được). Cột thiếu mô tả = checkpoint fail. Đây là nội dung sẽ đổ vào
+# dbt docs -> (Ext1) DataHub cho business tra cứu.
+# =============================================================================
+
+models:
+  - name: fact_transactions
+    description: >
+      One row per transaction that ever existed (source-purged rows excluded).
+      THE table every revenue/volume number must come from. Golden rule: real money
+      is net_amount, never a raw SUM(amount) — a transaction's face value only counts
+      when its status is COMPLETED; REVERSED money went out and came back (net zero);
+      FAILED and PENDING never moved money.
+    columns:
+      - name: txn_id
+        description: Unique transaction number from the banking system.
+        data_tests: [unique, not_null]
+      - name: account_id
+        description: The customer account that initiated this transaction.
+        data_tests:
+          - not_null
+          - relationships: { to: ref('dim_account'), field: account_id }
+      - name: merchant_id
+        description: The merchant on the other side of the transaction.
+        data_tests:
+          - not_null
+          - relationships: { to: ref('dim_merchant'), field: merchant_id }
+      - name: date_key
+        description: Calendar day the transaction was created, as YYYYMMDD (join to dim_date).
+        data_tests:
+          - not_null
+          - relationships: { to: ref('dim_date'), field: date_key }
+      - name: channel
+        description: Where the customer initiated it — ATM, card terminal (POS), web, app, or branch counter.
+        data_tests:
+          - relationships: { to: ref('dim_channel'), field: channel }
+      - name: txn_type
+        description: "Direction of money for the account: CREDIT = money in, DEBIT/TRANSFER = money out."
+      - name: status
+        description: >
+          Where the transaction is in its life: PENDING = accepted, outcome not yet
+          known; COMPLETED = money actually moved; FAILED = rejected, no money moved;
+          REVERSED = completed earlier and then undone (refund/dispute).
+      - name: amount
+        description: >
+          Face value of the transaction in account currency. NOT the number to sum for
+          revenue — use net_amount.
+        data_tests: [not_null]
+      - name: is_real_money
+        description: TRUE only when status is COMPLETED — the only rows where money truly moved.
+      - name: net_amount
+        description: >
+          The amount that actually counts: equals amount for COMPLETED, zero for
+          everything else. Guaranteed by an automated test — REVERSED can never be
+          double-counted.
+        data_tests: [not_null]
+      - name: created_at
+        description: When the customer made the transaction.
+        data_tests: [not_null]
+      - name: updated_at
+        description: Last time the banking system changed this transaction (e.g. PENDING → COMPLETED).
+
+  - name: dim_account
+    description: >
+      Customer accounts as they are RIGHT NOW, privacy-protected: no name, ID number,
+      full phone or email ever reaches this layer — analysts see hashes, partial masks
+      and birth year only. One row per account.
+    columns:
+      - name: account_id
+        description: Account number (join key to the fact).
+        data_tests: [unique, not_null]
+      - name: customer_name_hash
+        description: Irreversible fingerprint of the customer name — lets you count distinct customers without knowing who they are.
+      - name: phone_masked
+        description: Phone with middle digits hidden (e.g. +1-*****20) — enough for support staff to confirm, useless to a thief.
+      - name: email_masked
+        description: Email with local part hidden (e.g. ng***@gmail.com).
+      - name: birth_year
+        description: Year of birth only — supports age analytics without exposing a birthday.
+      - name: age
+        description: Approximate age in years, derived from birth_year.
+      - name: age_band
+        description: "Age group for reporting: 18-24, 25-34, 35-49, 50-64, 65+."
+      - name: account_type
+        description: "Product type: SAVINGS, CHECKING or CREDIT."
+      - name: balance
+        description: >
+          Current balance. Demo caveat: the data generator enforces no overdraft rule,
+          so balances can be unrealistically negative — treat as synthetic.
+      - name: opened_at
+        description: When the account was opened.
+
+  - name: dim_merchant
+    description: One row per merchant the bank's customers transact with.
+    columns:
+      - name: merchant_id
+        description: Merchant identifier (join key to the fact).
+        data_tests: [unique, not_null]
+      - name: merchant_name
+        description: Merchant trading name.
+      - name: category
+        description: "Spend category (Grocery, Fuel, Dining, Retail, Utilities, Travel, Health) — the axis for \"where do customers spend\" questions."
+      - name: city
+        description: City where the merchant operates.
+      - name: registered_at
+        description: When the merchant was onboarded.
+
+  - name: dim_date
+    description: >
+      Calendar table from the first transaction day to today — slice any measure by
+      week/month/quarter without writing date logic in the BI tool.
+    columns:
+      - name: date_key
+        description: Day as YYYYMMDD number (join key to the fact).
+        data_tests: [unique, not_null]
+      - name: full_date
+        description: The actual calendar date.
+        data_tests: [not_null]
+      - name: year
+        description: Calendar year.
+      - name: quarter
+        description: Calendar quarter (1-4).
+      - name: month
+        description: Month number (1-12).
+      - name: month_name
+        description: Month spelled out (January…).
+      - name: day_of_month
+        description: Day number within the month.
+      - name: day_of_week
+        description: Day number within the week (1 = Sunday … 7 = Saturday).
+      - name: day_name
+        description: Weekday spelled out (Monday…).
+      - name: week_of_year
+        description: ISO week number.
+      - name: is_weekend
+        description: TRUE on Saturday/Sunday — weekend vs weekday spending patterns.
+
+  - name: dim_channel
+    description: >
+      The five ways a customer can transact, enriched with analysis flags so business
+      can ask "what share of volume is digital" without remembering channel codes.
+    columns:
+      - name: channel
+        description: Channel code (ATM, POS, ONLINE, MOBILE, BRANCH).
+        data_tests: [unique, not_null]
+      - name: is_digital
+        description: TRUE for ONLINE and MOBILE — the "digital share" flag.
+      - name: requires_presence
+        description: TRUE where the customer must be physically somewhere (ATM, POS, BRANCH).

@@ -100,15 +100,23 @@ Bronze performs **no deduplication**. It is an append-only log.
 The main failure mode in this step is mismatched jars. Two rules:
 
 - `iceberg-spark-runtime-3.5_2.12` and `iceberg-aws-bundle` **must be the same Iceberg version**
-  (pinned to `1.6.1`), and the REST catalog image tracks the same line.
+  (pinned to `1.9.2`), and the REST catalog image runs that same version.
 - S3 access goes through Iceberg's own `S3FileIO` via `iceberg-aws-bundle`, **not** through
   `hadoop-aws` + `aws-java-sdk-bundle`. This removes the Hadoop/AWS SDK version conflict entirely.
 
 ```
 org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0
-org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1
-org.apache.iceberg:iceberg-aws-bundle:1.6.1
+org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.9.2
+org.apache.iceberg:iceberg-aws-bundle:1.9.2
 ```
+
+**How this version was chosen.** The usable versions are the intersection of two independently
+published sets: tags released for the `apache/iceberg-rest-fixture` image (`1.8.1` and up) and
+versions of the Spark 3.5 runtime jars on Maven Central (`1.7.0` and up). The overlap is
+`1.8.1`–`1.10.1`; `1.9.2` sits inside it as a patch release, new enough to carry the REST and
+`S3FileIO` fixes and old enough to be well exercised against Spark 3.5. An earlier attempt to
+pin `1.6.1` failed at image pull because no such image tag exists — check both sets before
+picking, rather than assuming a version is available everywhere. `1.10.1` is the fallback.
 
 A smoke import verifies the jars resolve before any stream is started. If a class is missing,
 the real error is reported and the version adjusted — versions are not guessed.

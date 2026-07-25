@@ -4,6 +4,279 @@ Nhật ký để resume nhanh sau khi context bị nén. Mới nhất ở trên.
 
 ---
 
+## 24-07-2026 (chiều) — Phase 2.5: Schema Registry + Avro (`verify_2_5.sh` 17/17)
+
+### Mục tiêu đạt
+Debezium giờ phát **Avro** qua **Apicurio Schema Registry** (không còn JSON trần). Hợp đồng
+schema được ENFORCE ở cổng Kafka: đổi schema không tương thích **bị chặn 409**, thay vì để
+Silver lặng lẽ ra NULL. Toàn bộ Silver/Gold/marts **không sửa một dòng** — chứng minh bằng
+`dbt build --full-refresh` 82/82 PASS trên Bronze-từ-Avro.
+
+### Quyết định (có tranh luận, ghi rõ đánh đổi)
+- **Format = Avro** (không JSON Schema). Lý do "chuẩn banking/interviewer" — nhưng ĐÁNH ĐỔI có
+  chủ đích: Bronze giờ lưu JSON **đã decode từ Avro**, không còn byte-exact của Debezium. Đổi
+  "audit byte-exact" lấy "typing chặt + chuẩn ngành". (Lean ban đầu của tôi chưa chặt, đã nói rõ.)
+- **Registry = Apicurio** (không Confluent SR). Vì image Debezium **bundle sẵn** Apicurio converter
+  (`apicurio-registry-utils-converter-2.4.1`), Confluent thì phải build image thêm jar. Apicurio
+  Apache-2.0, bật ccompat API (v7) nên tooling đọc như Confluent. Storage **kafkasql** (schema lưu
+  trong topic Kafka, sống sót restart, không cần DB riêng).
+
+### Cấu hình mấu chốt (nhớ để không vấp lại)
+- **`ENABLE_APICURIO_CONVERTERS=true`** trên connect: jar Apicurio CÓ trong image nhưng nằm ở
+  `/kafka/external_libs/apicurio` — cờ này nạp vào classpath. Thiếu nó: connector 400
+  "Class ...AvroConverter could not be found".
+- Connector: `key/value.converter=io.apicurio...AvroConverter`, `apicurio.registry.url=.../apis/registry/v2`,
+  `auto-register=true`, **`headers.enabled=false` + `as-confluent=true`** (wire-format Confluent:
+  1 magic byte + 4-byte id → Spark đọc được sau khi bỏ 5 byte).
+- **Bronze decode:** `spark-avro_2.12:3.5.0` + `from_avro`. Lấy schema qua Apicurio **API v2
+  `?dereference=true`** (KHÔNG ccompat/latest) — vì Debezium tách type `...Source` ra artifact
+  riêng (schema reference); ccompat trả schema chưa resolve → from_avro chết
+  "...Source is not a defined name". Dereference inline Source → schema tự chứa. Decode:
+  `to_json(from_avro(substring(value,6,...), schema))` → `value` là JSON y như trước → Silver nguyên vẹn.
+
+### Enforcement (điểm cốt lõi)
+- `scripts/test_schema_compat.py`: set **BACKWARD** lên 3 subject value production (hardening thật)
+  + demo trên subject throwaway: incompatible (đổi kiểu field) → **409 BỊ CHẶN**, compatible
+  (thêm optional có default) → 200. Bẫy: POST schema qua ccompat phải **giữ `references`** (không
+  thì 422 "invalid Avro schema"), hoặc dùng schema tự chứa.
+
+### Reset an toàn hoá (bài học SPOF)
+- `reset_all.sh` cũ dùng `down -v` → xoá pgdata = mất luôn `iceberg_catalog`/`marts`/`superset`
+  (3 DB tạo tay). Sửa: **`postgres/init/03_extra_databases.sh`** tự tái lập 3 DB + 2 user
+  (marts_ro, superset_meta) trên volume trống → `down -v` tái lập được từ số 0. Postgres service
+  +2 env password. reset_all thêm bước chờ Apicurio trước khi đăng ký connector.
+- Lưu ý: reset xoá metadata Superset → **dataset marts phải đăng ký lại** (đã script qua API).
+
+### Bẫy gặp & xử
+- Subject `transactions-value` bị **ẩn khỏi listing** sau khi tôi xoá 1 version thử nghiệm (nhưng
+  version 1 vẫn active, connector vẫn chạy). `verify_2_5.sh` đổi sang kiểm `/versions` (functional)
+  thay `/subjects` (listing).
+- Quản lý background stream chập chờn qua các phiên (nohup log biến mất, false pgrep) → chuyển sang
+  chạy stream qua cơ chế background của harness cho ổn định.
+
+### Xong Phase 2.5 (gồm README public đã cập nhật status + highlight). 
+NEXT = Phase 3 (Airflow orchestrate) — giờ pipeline đã ổn định trên Avro nên orchestrate không
+phải làm lại. Xem `CURRENT_STATUS.md` (gitignored) để nắm nhanh trạng thái vận hành.
+
+---
+
+## 24-07-2026
+
+### Phase 2 (core) — dbt-on-Spark: Silver + Gold XONG, 71/71 tests PASS
+- **dbt stack:** dbt-core 1.12 + dbt-spark 1.11, **method: session** trên host venv (không
+  Thrift server). Spark conf nạp qua `SPARK_CONF_DIR` (`dbt_project/spark-conf/`), secrets đi
+  bằng env `AWS_*` (S3FileIO default chain) → profiles.yml + spark-defaults.conf KHÔNG chứa
+  secret, commit được. Chạy qua `scripts/dbt.sh <lệnh>`.
+- **Đúng trình tự plan: TESTS TRƯỚC** — sources.yml (freshness 15m/2h) + contracts đầy đủ
+  cho Silver/Gold viết trước khi viết SQL. Tổng: 12 source + 32 silver + 27 gold = **71 PASS**.
+- **Silver** (`models/silver/`): current-state MERGE theo PK, incremental theo watermark
+  `_kafka_offset` (topic 1 partition → offset order = commit order; nhiều partition thì phải
+  watermark per-partition). Macro dùng chung `cdc_latest_events`/`cdc_field` (macros/cdc.sql) —
+  logic collapse viết 1 lần cho cả 3 model. Soft-delete (op=d → is_deleted, giá trị lấy từ
+  before-image). **PII mask ngay tại Silver** (macros/mask_pii.sql): hash SHA-256
+  (name/national_id), partial mask (phone/email), generalize (dob→birth_year).
+  Kết quả: 2.92M txn current-state, 16.5k soft-deleted, 2.7k PENDING (gồm nhóm treo).
+- **Parse theo BẰNG CHỨNG envelope thật** (đừng đoán): TIMESTAMPTZ → chuỗi ISO (cast timestamp
+  được), DATE → SỐ NGÀY epoch (date_add), DECIMAL → string (cast đúng 1 lần ở Silver).
+- **Gold** (`models/gold/`): star schema Kimball — `fact_transactions` (grain: 1 dòng/txn,
+  loại dòng purged; **net_amount = amount nếu COMPLETED else 0**; is_real_money) + dim_account
+  (age_band, natural key có ghi trade-off) + dim_merchant + dim_date (spine sinh từ min ngày)
+  + dim_channel (is_digital). Materialized=table rebuild → idempotent bẩm sinh cho Phase 3.
+- **Luật REVERSAL/FAILED/PENDING có CỔNG TỰ ĐỘNG:** singular test
+  `tests/assert_reversed_never_counted.sql` (vi phạm → fail run). MỌI cột Gold có mô tả
+  nghiệp vụ (gate của OPTIMIZATION 1.3). `dbt docs generate` ra catalog/manifest/lineage.
+- Ghi chú data: faker không có luật chống thấu chi → balance âm cực lớn; ghi caveat trong
+  dim_account, ứng viên check Great Expectations Phase 4.
+
+### Catalog SQLite → POSTGRES backend (sự cố lần 2 → làm luôn OPTIMIZATION 2.5)
+- dbt build đầu tiên chết: **`SQLITE_BUSY_SNAPSHOT`** — lỗi ĐẶC THÙ WAL mode khi dbt (writer
+  mới) chen vào 3 stream; busy_timeout KHÔNG cứu được loại này (transaction phải restart,
+  không phải chờ). Chính journal_mode=WAL thêm hôm 22-07 mở ra failure mode này.
+- Fix đúng đơn đã kê: **JdbcCatalog backend → Postgres** (db mới `iceberg_catalog` trong
+  gtl-postgres, KHÔNG đụng db banking). Image fixture không có driver Postgres → mount
+  `jars/postgresql-42.7.4.jar` + override command sang `java -cp ... RESTCatalogServer`.
+  Migrate = copy **4 dòng** (iceberg_tables ×3 + namespace_properties ×1, catalog_name
+  `rest_backend`) từ sqlite sang. Verify: REST trả đủ bronze/3 bảng; stream + dbt ghi
+  **song song** không lỗi. SQLite cũ giữ nguyên tại `iceberg-catalog/` làm backup.
+- Bài học: URI đổi backend chỉ 1 dòng, nhưng phải nhớ (1) driver jar không có sẵn trong
+  image, (2) copy đúng `catalog_name`, (3) dừng writer trước khi migrate.
+
+### Phase 2 — serving + checkpoint XONG (`verify_2.sh` 16/16)
+- **Marts** (`models/marts/`): 3 bảng aggregate (daily_volume, channel_daily, category_daily),
+  mọi số tiền qua `net_amount`, có `_refreshed_at` (freshness stamp cho business). Exposure
+  `transaction_overview_dashboard` khai trong dbt → lineage chạy tới tận dashboard.
+- **Đường A (mart→Postgres):** `spark/gold_layer/push_marts.py` đẩy mart Iceberg → db `marts`
+  trong gtl-postgres (overwrite+truncate giữ grant). User `marts_ro` chỉ-SELECT (verify chặn ghi).
+- **Superset** (service compose, port 8088): image `apache/superset:4.1.1` + psycopg2 (Dockerfile
+  riêng vì bản mới lược driver). Metadata DB = db `superset`; datasource "GTL Marts" trỏ marts_ro;
+  bootstrap.sh tự migrate+admin+init idempotent. 3 dataset đăng ký qua API. **Chứng minh
+  end-to-end:** Superset chạy SQL thật trên marts ra đúng số. Business login là dựng chart được.
+- **Checkpoint:** `scripts/verify_2.sh` 16/16 — star schema đủ, dbt 71 tests, REVERSAL-assert,
+  lineage, marts tươi, least-privilege, Superset query được.
+
+### SỰ CỐ: small-files problem (bài học lakehouse quan trọng NHẤT phiên này)
+- **Triệu chứng:** full `dbt build` (Silver incremental MERGE) lỗi `Connection reset` từ MinIO,
+  15 lỗi khi có stream / 3 lỗi khi dừng stream. Subset build thì xanh. Không phải OOM.
+- **Root cause (đo bằng `.files`):** Bronze stream commit mỗi 5s → **bronze.transactions 4,449
+  file** × ~2000 dòng, **accounts 4,454 file** (small-files kinh điển của streaming). Incremental
+  Silver quét hàng nghìn file nhỏ → bùng nổ S3 GET → MinIO single-node reset connection.
+- **Fix chuẩn ngành:** `spark/maintenance.py` — Iceberg `rewrite_data_files` (nén → 128MB) +
+  `expire_snapshots` (giữ 10). Kết quả **accounts 4,454→3, transactions →6 file**. Sau nén,
+  full build + stream chạy **song song** đều 82/82 xanh.
+  - Sub-bẫy: nén 4400 file một lượt OOM + broadcast → thêm `autoBroadcastJoinThreshold=-1`,
+    `partial-progress.enabled=true`, `max-file-group-size-bytes=256MB`, driver 6g.
+- **Bài học:** streaming LUÔN đẻ small file → compaction định kỳ là BẮT BUỘC, không phải tuỳ chọn.
+  Production auto-compact; ở đây `maintenance.py` chạy tay giờ, vào DAG Airflow Phase 3. Đây chính
+  là task "Iceberg snapshot maintenance" mà plan xếp Phase 4 — nhưng cần SỚM vì downstream đọc.
+- **MinIO limit 512M→1536M** (từng nghẹt 86% khi 3 workload đồng thời) — nhưng nén mới là fix gốc.
+
+### Hạ tầng Postgres giờ gánh 4 DB (1 instance, tách bạch)
+`banking` (nguồn CDC) · `iceberg_catalog` (JDBC catalog backend) · `marts` (serving) ·
+`superset` (metadata BI). Users least-privilege: `bank`, `debezium` (RO replication),
+`marts_ro` (RO), `superset_meta`. Đúng tinh thần tách quyền, tái dùng instance thay vì dựng mới.
+
+---
+
+## 20-07-2026
+
+### Phase 1c ✅ XONG — Bronze Iceberg trên MinIO (`verify_1c.sh` 13/13)
+- **Kết quả:** Bronze `transactions` 16.9M dòng · `accounts` 7.84M · lag **82 message** (~vài giây)
+  → **near-real-time đạt**. `op`: c=8.37M, u=8.53M, **d=3** (mục tiêu Phase 1: bắt được DELETE).
+  Envelope nguyên vẹn, tiền giữ dạng **string**.
+- **Dựng mới:** `minio` (S3 API 9001 / console 9002, bucket `warehouse`) · `iceberg-rest`
+  (8181, catalog sqlite bền qua bind mount) · **Spark venv trên HOST** (`~/working/gtl-spark-venv`,
+  pyspark 3.5.0, Java 17 JRE) — KHÔNG dùng container.
+- **Code:** `spark/{gtl_session,bronze_stream,smoke_test,verify_bronze}.py` ·
+  `scripts/{verify_1c,reset_all}.sh` · spec `docs/phase-1c-bronze-design.md`.
+
+### Quyết định thiết kế (có tranh luận, không mặc định)
+- **3 bảng mirror 1:1 với nguồn** (1 fact + 2 dim), KHÔNG gộp 1 bảng. Lý do quyết định:
+  fact/dim khác hồ sơ vật lý (partition theo ngày chỉ có nghĩa với fact), và **Silver `MERGE INTO`
+  theo PK khác nhau** (`txn_id` vs `account_id`) → gộp thì merge-theo-key vô nghĩa.
+- **Bronze RAW, không flatten** — giữ nguyên envelope trong cột `value`; flatten/ép kiểu/mask PII/
+  dedup là việc của Silver. Bronze ghi, Silver diễn giải.
+- **Spark chạy host, không container:** Kafka đã advertise sẵn `EXTERNAL://localhost:9093` cho
+  client ở host → khỏi bắc cầu network giữa 2 stack.
+- **Né `hadoop-aws`**: dùng `iceberg-aws-bundle` + `S3FileIO` → tránh hẳn xung đột version Hadoop/AWS SDK.
+- **3 query trong 1 SparkSession**, checkpoint riêng từng bảng → cô lập, restart/backfill độc lập.
+- **Nguồn sự thật vẫn là Postgres**; lakehouse là bản sao phái sinh. Giữ CDC-từ-bảng (không đổi
+  sang app bắn event thẳng → dính dual-write). **Outbox pattern** ghi vào roadmap mở rộng.
+
+### Sự cố & bài học (quan trọng — đừng vấp lại)
+1. **Kafka retention 7 ngày đã xoá data trước khi có ai hứng.** `merchants` mất sạch 50 message,
+   `transactions` mất 1,326,675 event đầu. Nguyên nhân: 1b dựng xong 13-07, faker bơm liên tục,
+   nhưng Bronze (consumer bền) mãi 1c mới có → 7 ngày sau retention cắt.
+   → **Đã nâng lên 30 ngày + `retention.bytes` chặn trên** (40/25/1 GB). Đo thật: 20.6GB/7 ngày
+   → ~88GB cho 30 ngày, đĩa còn 382GB.
+   → Nguyên tắc: retention định cỡ theo **thời gian consumer chết lâu nhất chấp nhận được**,
+   KHÔNG phải "giữ càng lâu càng tốt" (vô hạn chỉ đẩy vấn đề sang đĩa). Bảo vệ thật là
+   **giám sát lag so với mép retention** → Phase 5.
+   → KHÔNG khôi phục merchants: data test, sẽ reset sạch trước Phase 2.
+2. **`apache/iceberg-rest-fixture:1.6.1` KHÔNG tồn tại.** Version dùng được = giao của
+   *tag image đã phát hành* ∩ *JAR trên Maven* → chốt **1.9.2**. Luôn kiểm tra CẢ HAI tập
+   trước khi pin, đừng giả định version có ở mọi nơi.
+3. **`SQLITE_CANTOPEN`** — named volume Docker tạo ra thuộc `root:root` 755, image chạy uid 1000
+   → không ghi được. Đổi sang **bind mount thư mục host** (senryuu cũng uid 1000). Cùng họ lỗi
+   work-dir của `spark-worker`.
+4. **Spark cache metadata bảng Iceberg trong session** → `count()` lần hai trả về snapshot cũ,
+   stream đang chạy mà trông như đứng hình. Phải `REFRESH TABLE` trước khi đếm lại.
+5. **Check phải phân biệt "pipeline hỏng" với "thượng nguồn không có gì".** `verify_1c.sh` bản đầu
+   fail vì `bronze.merchants` rỗng — nhưng Kafka không còn message nào để đọc. Đã sửa: so với
+   offset Kafka, và đo **lag** thay vì đòi "số dòng phải tăng" (đòi tăng cũng sai khi đã bắt kịp).
+6. **BẪY RESET (nguy hiểm nhất, chưa gặp nhưng đã chặn):** khoá chính là
+   `GENERATED ALWAYS AS IDENTITY` + faker có `RANDOM_SEED` cố định → sau `down -v` sequence quay
+   về 1, lứa data mới **tái dùng đúng khoá chính cũ**. Nếu Bronze còn data cũ → hai thế hệ trùng PK
+   → Silver `MERGE ON txn_id` **gộp nhầm hai giao dịch không liên quan, không báo lỗi**.
+   → `docker compose down -v` KHÔNG đủ: nó không đụng `iceberg-catalog/` (bind mount) và
+   `_checkpoints/` (host). Bỏ sót checkpoint còn tệ hơn — stream tưởng đã đọc rồi và **bỏ qua data mới**.
+   → Viết `scripts/reset_all.sh` reset nguyên tử **4 kho** + dừng job trước khi xoá.
+
+### Reset thật + faker sinh DELETE (cuối phiên)
+- Đã chạy `reset_all.sh` → 4 kho sạch, dựng lại, `merchants` có lại đủ 50 message
+  (xác nhận: reset giải quyết gọn, KHÔNG cần incremental snapshot).
+- **Phát hiện sau reset: `op=d` biến mất.** Vì faker **chưa bao giờ xoá gì** — 3 dòng `op=d`
+  ở lần chạy trước là do tay tôi xoá thử lúc verify 1b, không phải workload sinh ra.
+  → Thêm **`purge_failed()`** vào faker: định kỳ xoá giao dịch `FAILED` quá hạn lưu trữ
+  (`PURGE_AFTER_MINUTES=2`, demo nén thang thời gian; chính sách thật tính bằng tháng).
+  → **CHỈ xoá `FAILED`** — nó không chuyển tiền nên không phá đối soát Bronze=Gold.
+  `COMPLETED`/`REVERSED` là tiền thật, KHÔNG BAO GIỜ hard-delete (ngân hàng đảo chiều bằng
+  REVERSAL, không xoá bản ghi).
+  → Lý do chính đáng chứ không phải vá test: hệ thống *không bao giờ xoá gì* mới là thứ phi thực tế;
+  và purge thường là **job chạy NGOÀI ứng dụng** — đúng loại thay đổi mà CDC log-based bắt được
+  còn polling theo timestamp **bỏ sót hoàn toàn** (dòng biến mất, không còn timestamp để so).
+- Kết quả: `verify_1c.sh` **13/13** trên dataset sạch, `d=12` khớp đúng `12` tombstone.
+- Sửa thêm: `verify_1c.sh` đọc offset stream TRƯỚC rồi mới hỏi Kafka (trước đó ra lag âm).
+
+### Mô phỏng SỰ CỐ trong faker — "nghĩ đến trường hợp tệ nhất"
+Phản hồi của Mr. Senryuu: faker luôn giải quyết mọi PENDING = đang mô phỏng một thế giới không
+bao giờ có sự cố, và **đó là sai** — DE phải nghĩ tới ca tệ nhất.
+- **Lý do kỹ thuật (không chỉ realism):** nếu dữ liệu nguồn không bao giờ chứa ca xấu thì các
+  nhánh xử lý ca xấu ở Silver/Gold/alerting **không bao giờ được chạy** → sai mà không ai phát
+  hiện. Cụ thể chưa được kiểm chứng: (1) PENDING treo có tính vào doanh số Gold không (KHÔNG —
+  tiền chưa đi); (2) đối soát Bronze=Gold xử lý PENDING ra sao; (3) treo bao lâu thì báo động.
+- **Ba nhóm giao dịch giờ luôn tồn tại trong bảng nguồn:**
+  | Nhóm | Chọn bằng | Mô phỏng |
+  |---|---|---|
+  | bình thường ~99% | `txn_id % 200 <> 0` | chốt trong tích tắc |
+  | treo rồi được cứu | `% 200 = 0` và `% 1000 <> 0` | downstream timeout → sweeper chốt sau 3 phút |
+  | treo VĨNH VIỄN | `% 1000 = 0` | in-doubt, cần người can thiệp → Phase 5 phải báo động |
+- **Chọn theo `txn_id % N` chứ KHÔNG dùng `random()`**: một dòng đã treo thì treo thật, không
+  phải mỗi vòng lặp lại tung xúc xắc rồi vô tình thoát.
+- `sweep_stuck_pending()` dùng `SWEEP_COMPLETE_RATE=0.5` (thấp hơn 0.85 của vòng đời thường):
+  giao dịch đã timeout thì khả năng hỏng cao hơn. Hệ thống thật xác định kết quả bằng cách
+  **hỏi lại mạng thanh toán**, không phải tung đồng xu — con số này chỉ để dữ liệu đúng xu hướng.
+- `advance_pending` phải LOẠI TRỪ nhóm treo **ngay trong câu SELECT** — nếu không, các dòng treo
+  (cũ nhất) chiếm hết `LIMIT` và chặn đứng việc xử lý giao dịch bình thường.
+- Trạng thái ổn định quan sát được: nhóm 2 hội tụ ~18 dòng (0.1/s × ngưỡng 180s = hàng đợi có
+  giới hạn), nhóm 3 tăng mãi ~72 dòng/giờ vì demo không có người chốt — **đúng như thực tế** một
+  hệ thống không ai xử lý in-doubt thì backlog phải phình.
+- Kết quả sau thay đổi: `verify_1c.sh` **13/13**, `op=d`=225 khớp đúng 225 tombstone.
+
+### Tái cấu trúc `spark/` + sự cố catalog SQLite (cuối phiên 20-07 / đầu 22-07)
+- **Chia `spark/` theo layer** (yêu cầu của Mr. Senryuu), đồng bộ hậu tố `*_layer`:
+  `bronze_layer/` (bronze_stream.py, verify_bronze.py, bronze_explore.ipynb) ·
+  `silver_layer/` (silver_transform.py scaffold + notebook) ·
+  `gold_layer/` (gold_model.py scaffold + notebook). `gtl_session.py` + `smoke_test.py` giữ ở gốc
+  `spark/` (dùng chung, import qua `PYTHONPATH=spark` nên file dời xuống con vẫn resolve).
+  Mỗi layer có **1 .py + 1 .ipynb** (notebook chạy bằng venv host, đã execute thử bronze OK).
+  Cập nhật đường dẫn trong `verify_1c.sh`, `reset_all.sh`, README, worklog.
+- **Stream chết khi phiên trước đứt** (checkpoint đóng băng ở 480k, Kafka bơm tiếp lên 3.99M).
+  Restart resume đúng offset — **không mất data** nhờ checkpoint.
+- **SỰ CỐ MỚI khi restart — `SQLITE_BUSY: database is locked` → HTTP 500 → stream abort.**
+  Nguyên nhân gốc: **3 query streaming commit SONG SONG vào cùng catalog SQLite**. SQLite chỉ cho
+  MỘT writer/lần và mặc định thất bại NGAY khi gặp khoá. Lúc backfill 3 topic đồng thời, commit
+  đụng nhau. (KHÔNG phải OOM — RAM catalog chỉ 42%.)
+  → Vá: `CATALOG_URI` thêm `?busy_timeout=30000&journal_mode=WAL` — SQLite CHỜ khoá tới 30s
+  (commit chỉ mất ms) thay vì gục; WAL cho reader song song writer.
+  → **Bài học kiến trúc (designed-for-scale, demo-small):** catalog SQLite KHÔNG chịu được nhiều
+  writer — production dùng **Postgres/Glue/Nessie** làm JDBC catalog backend. busy_timeout chỉ là
+  cách hợp lệ ở quy mô demo. Ghi rõ ranh giới này trong compose + đây.
+
+### Nợ đã ghi nhận
+- `issues/003`: **chưa có signal channel** → phương án "re-snapshot được" của CDC risk #1 mới nằm
+  trên giấy. Khi làm, phải dùng **Kafka signal channel** chứ KHÔNG dùng signal table (signal table
+  đòi cấp quyền `INSERT` cho role `debezium` → phá vỡ least-privilege mà `verify.sh` đang kiểm tra).
+- `issues/004`: thiếu **`idempotency_key`** trên `transactions` — hàng rào chống trừ tiền hai lần
+  khi client retry. Cũng là vấn đề của tầng dữ liệu: thiếu nó thì đối soát Phase 4 KHÔNG phân biệt
+  được "khách trả hai lần" với "hệ thống trừ nhầm hai lần". Hoãn có chủ đích vì đổi schema cần
+  `down -v` → **gộp vào lần reset trước Phase 2**, cùng với `issues/002` (counterparty TRANSFER).
+
+### NEXT — Phase 2 (Medallion transform)
+Silver: parse envelope → ép kiểu → mask PII → **`MERGE INTO` theo PK ra current-state**;
+REVERSED không đếm hai lần, FAILED không tính vào volume. Gold star schema + dbt structural tests.
+**Nên chạy `scripts/reset_all.sh` trước Phase 2** để Silver có dataset sạch, nhất quán.
+
+### Cách chạy lại
+```bash
+cd ~/working/projects/Governed-Transaction-Lakehouse
+docker compose up -d
+bash scripts/register-connector.sh
+PYTHONPATH=spark ~/working/gtl-spark-venv/bin/python spark/bronze_layer/bronze_stream.py   # chạy nền
+bash scripts/verify.sh && bash scripts/verify_1b.sh && bash scripts/verify_1c.sh
+```
+
+---
+
 ## 18-07-2026
 
 ### Chốt phiên

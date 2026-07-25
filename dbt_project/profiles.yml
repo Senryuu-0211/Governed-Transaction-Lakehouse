@@ -1,0 +1,16 @@
+# Profile dbt — KHÔNG chứa secret nào nên commit được.
+# method: session = dbt mở SparkSession ngay trong process (host venv), không cần
+# Thrift server. Cấu hình Spark (jars, Iceberg catalog) nạp từ SPARK_CONF_DIR
+# (xem spark-conf/spark-defaults.conf); credentials S3 đi qua env AWS_* do
+# scripts/dbt.sh export từ .env.
+gtl_lakehouse:
+  target: dev
+  outputs:
+    dev:
+      type: spark
+      method: session
+      host: localhost # session mode không dùng, nhưng schema profile đòi có
+      schema: silver # schema mặc định; model tự khai schema riêng
+      # threads=1 CÓ CHỦ ĐÍCH: catalog đang là SQLite (1 writer/lần, đã có
+      # busy_timeout nhưng không nên chen nhau). Nâng lên khi catalog → Postgres.
+      threads: 1
