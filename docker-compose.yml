@@ -251,7 +251,10 @@ services:
       - ./jars/postgresql-42.7.4.jar:/opt/jars/postgresql.jar:ro
     # Image mặc định `java -jar` (bỏ qua classpath ngoài) -> override sang -cp để
     # nạp thêm driver. Main class lấy từ log khởi động của chính image này.
-    command: ["java", "-cp", "iceberg-rest-adapter.jar:/opt/jars/postgresql.jar", "org.apache.iceberg.rest.RESTCatalogServer"]
+    # -Xmx1g: heap mặc định của JVM = ~25% mem_limit. Với limit 512M cũ -> chỉ ~128MB,
+    # OOM khi stream commit backlog lớn / chạy song song dbt (sự cố 26-07). Set -Xmx tường
+    # minh 1g (trong mem_limit 1536M bên dưới) để catalog chịu được commit đồng thời.
+    command: ["java", "-Xmx1g", "-cp", "iceberg-rest-adapter.jar:/opt/jars/postgresql.jar", "org.apache.iceberg.rest.RESTCatalogServer"]
     depends_on:
       minio:
         condition: service_healthy
@@ -260,7 +263,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512M
+          memory: 1536M   # 512M -> 1536M: chứa heap 1g (-Xmx) + metaspace/off-heap. Host dư 37G.
     restart: unless-stopped
 
   # ---- Apicurio Schema Registry (Phase 2.5) --------------------------------

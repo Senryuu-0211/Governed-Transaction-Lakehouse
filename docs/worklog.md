@@ -4,6 +4,45 @@ Nhật ký để resume nhanh sau khi context bị nén. Mới nhất ở trên.
 
 ---
 
+## 26-07-2026 — Phase 3: Airflow orchestration (`verify_3.sh` 6/6 + end-to-end xanh)
+
+### Mục tiêu đạt
+2 DAG điều phối nhánh batch, chạy từ stack `airflow-docker` sẵn có (KHÔNG dựng Airflow thứ 2):
+- `gtl_transform @hourly`: `cdc_health → dbt_run → dbt_test → push_marts`. **`dbt_test` là CỔNG** —
+  fail thì `push_marts` skip (trigger_rule all_success) → số bẩn không ra Superset.
+- `gtl_maintenance @daily`: `maintenance.py` (compaction + expire snapshots).
+End-to-end thật: dbt **11 model PASS**, **71 test PASS**, marts Postgres refresh. Cả 2 DAG **unpause**.
+
+### Quyết định (ghi rõ đánh đổi)
+- **Airflow điều phối, host tính toán — qua `SSHOperator`.** Container Airflow KHÔNG có venv/Java/Spark
+  (đã chứng minh: worker thấy Python 3.12, không java, không thấy gtl-spark-venv). Nên mọi task chỉ
+  SSH về host chạy trong venv thật. Không nhét pyspark vào image Airflow (phá core budget, trộn
+  điều phối với tính toán). Không dựng Airflow host-native (trùng lắp orchestrator, phá reproducible).
+- **Deploy-by-COPY, không symlink.** Container chỉ mount dags folder → symlink trỏ ra project dir
+  GÃY (`No such file or directory` trong container). `scripts/deploy_dags.sh` copy 3 file DAG vào
+  dags folder. File Spark xử lý data KHÔNG copy — chạy tại host qua SSH, DAG chỉ trỏ đường dẫn.
+- **Cầu SSH:** key ed25519 riêng (`gtl_airflow_ed25519`, thu hồi độc lập) + connection `gtl_host_ssh`
+  → gateway `172.18.0.1` (lấy động từ `docker inspect worker`), `no_host_key_check` (LAN Tailscale).
+
+### Sự cố lớn (bài học đắt — `issues/005`)
+Chạy end-to-end lúc stream live → **iceberg-rest OOM** (`Service failed: 500: OutOfMemoryError`).
+Gốc: catalog `mem_limit 512M` + KHÔNG `-Xmx` → heap mặc định ~128MB, quá nhỏ khi commit đồng thời /
+backlog lớn. Catalog chết giữa commit → stream `CommitStateUnknownException` → tự tắt. Qua 27h
+(ranh giới phiên) stream chết, backlog 27h + hàng nghìn small-file dồn lại → restart stream cũng OOM,
+và dbt đọc Bronze bị MinIO `Connection reset`.
+**Fix:** `-Xmx1g` + mem_limit 1536M cho iceberg-rest (data ở Postgres+MinIO → recreate mất 0 byte);
+`maintenance.py` nén backlog (accounts 9.102→15 file). **Bài học:** core budget chỉ lo Spark, BỎ SÓT
+heap của service catalog dùng chung — nút cổ chai ẩn của mọi luồng đọc/ghi. Và: pipeline nằm im
+KHÔNG orchestration chính là thứ sinh ra backlog — đúng lý do Phase 3 tồn tại.
+
+### Cấu hình mấu chốt (nhớ để không vấp lại)
+- Setup 1 lần: `setup_airflow_conn.sh` → `deploy_dags.sh` → `airflow dags reserialize` → `verify_3.sh`.
+- Sửa DAG: chạy lại `deploy_dags.sh` (bước deploy: code ở repo → đẩy runtime).
+- `cdc_health` đọc mtime `_checkpoints/transactions/commits/` (< 900s) — không cần khởi động Spark.
+- Bẫy verify: `set -o pipefail` + `grep -q` → grep khớp đóng pipe → SIGPIPE → fail giả. Hứng biến rồi grep.
+
+---
+
 ## 24-07-2026 (chiều) — Phase 2.5: Schema Registry + Avro (`verify_2_5.sh` 17/17)
 
 ### Mục tiêu đạt

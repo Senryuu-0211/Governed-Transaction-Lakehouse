@@ -81,7 +81,11 @@ each run.
   dashboards over a Postgres serving copy of the marts
 - ✅ **Phase 2.5** — **Schema Registry (Avro)**: Debezium emits Avro through Apicurio; incompatible
   source schema changes are **rejected at the Kafka gate** instead of silently nulling downstream
-- ⬜ Phase 3 — Airflow orchestration (idempotent, backfillable)
+- ✅ **Phase 3** — Airflow orchestration: two DAGs (`gtl_transform` hourly, `gtl_maintenance`
+  daily) driven from the existing containerized Airflow via **`SSHOperator` to host-side
+  Spark/dbt** (Airflow orchestrates, the host computes); `dbt_test` **gates** `push_marts` so bad
+  data never reaches Superset; `verify_3.sh` 6/6 and a full end-to-end run green (dbt 11 models,
+  71 tests, marts refreshed)
 
 ### Step 1a highlights
 - `wal_level=logical` with replication slots ready for Debezium
