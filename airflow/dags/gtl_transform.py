@@ -7,8 +7,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from airflow import DAG
 from gtl_common import CDC_HEALTH_CMD, VENV_PY, ssh_task
+
+from airflow import DAG
 
 default_args = {"retries": 2, "retry_delay": timedelta(minutes=3)}
 

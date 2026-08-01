@@ -20,12 +20,13 @@ Tốc độ chỉnh qua env TXN_RATE (số INSERT/giây, mặc định 20).
 Thiết kế để scale: logic giống nhau ở mọi quy mô; DEMO chạy nhỏ (~100 accounts,
 ~50 merchants, ~20 txn/s) trên home server — KHÔNG giả vờ chạy tỷ bản ghi.
 """
+import decimal
 import os
 import random
 import time
-import decimal
 
 import psycopg
+
 from faker import Faker
 
 fake = Faker()
@@ -58,7 +59,8 @@ PURGE_AFTER_MINUTES = int(os.getenv("PURGE_AFTER_MINUTES", "2"))
 # treo thật, không phải mỗi vòng lặp lại được tung xúc xắc rồi vô tình được cứu.
 STUCK_EVERY = int(os.getenv("STUCK_EVERY", "200"))            # 1/200 giao dịch bị treo
 UNRECOVERABLE_EVERY = int(os.getenv("UNRECOVERABLE_EVERY", "1000"))  # 1/1000 treo vĩnh viễn
-STUCK_AFTER_MINUTES = int(os.getenv("STUCK_AFTER_MINUTES", "3"))     # quá hạn này thì job quét vào cuộc
+# quá hạn này thì job quét vào cuộc
+STUCK_AFTER_MINUTES = int(os.getenv("STUCK_AFTER_MINUTES", "3"))
 # Giao dịch đã timeout thì XÁC SUẤT THÀNH CÔNG THẤP HƠN giao dịch bình thường —
 # hệ thống thật xác định kết quả bằng cách hỏi lại mạng thanh toán, không phải tung
 # đồng xu; con số này chỉ để dữ liệu phản ánh đúng xu hướng đó.

@@ -29,7 +29,6 @@ import sys
 from datetime import datetime, timedelta
 
 import boto3
-
 from gtl_session import CATALOG, get_spark, load_env
 
 # Nén cả Bronze (nguồn small file) lẫn Silver (MERGE cũng đẻ file). Gold=table
@@ -81,6 +80,17 @@ def table_location(spark, fqn: str) -> str:
     raise RuntimeError(f"không đọc được Location của {fqn}")
 
 
+def s3_prefix(location: str, bucket: str) -> str:
+    """Đổi `s3://<bucket>/warehouse/bronze/tbl` -> prefix `warehouse/bronze/tbl/`.
+
+    Tách riêng khỏi phần gọi mạng để test được: đây là code cấp danh sách file cho
+    một thủ tục XOÁ FILE, nên prefix sai một ký tự có thể có nghĩa là liệt kê nhầm
+    thư mục. Rẻ hơn nhiều nếu sai ở đây bị bắt bằng unit test thay vì bằng data mất.
+    """
+    prefix = location.split(f"s3://{bucket}/", 1)[-1]
+    return prefix.rstrip("/") + "/"
+
+
 def build_file_list_view(spark, s3, bucket, location: str, view: str) -> int:
     """Liệt kê MỌI object dưới thư mục bảng bằng boto3 -> temp view cho Iceberg.
 
@@ -101,7 +111,7 @@ def build_file_list_view(spark, s3, bucket, location: str, view: str) -> int:
 
     View cần đúng 2 cột: file_path (string) · last_modified (timestamp).
     """
-    prefix = location.split(f"s3://{bucket}/", 1)[-1].rstrip("/") + "/"
+    prefix = s3_prefix(location, bucket)
     rows = []
     for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
@@ -112,6 +122,24 @@ def build_file_list_view(spark, s3, bucket, location: str, view: str) -> int:
         rows, "file_path string, last_modified timestamp"
     ).createOrReplaceTempView(view)
     return len(rows)
+
+
+def call_orphan(spark, table: str, cutoff: str, view: str, dry_run: bool) -> list:
+    """Gọi `remove_orphan_files`. Tham số truyền TƯỜNG MINH, không bắt qua closure.
+
+    Trước đây hàm này định nghĩa BÊN TRONG vòng lặp bảng và đóng gói `table`/`view`
+    từ biến vòng lặp. Chạy vẫn đúng (gọi ngay trong cùng vòng), nhưng ruff B023 chỉ
+    ra đây là mìn: ai đó gom các closure lại gọi sau thì TẤT CẢ dùng giá trị của
+    bảng CUỐI CÙNG. Với code xoá file trong lakehouse thì "hiện tại vẫn đúng" không
+    phải lý do đủ tốt để giữ.
+    """
+    return spark.sql(
+        f"CALL {CATALOG}.system.remove_orphan_files("
+        f"  table => '{table}',"
+        f"  older_than => TIMESTAMP '{cutoff}',"
+        f"  file_list_view => '{view}',"
+        f"  dry_run => {str(dry_run).lower()})"
+    ).collect()
 
 
 def main() -> int:
@@ -164,25 +192,16 @@ def main() -> int:
         view = f"file_list_{table.replace('.', '_')}"
         listed = build_file_list_view(spark, s3, bucket, table_location(spark, fqn), view)
 
-        def call_orphan(dry: str):
-            return spark.sql(
-                f"CALL {CATALOG}.system.remove_orphan_files("
-                f"  table => '{table}',"
-                f"  older_than => TIMESTAMP '{orphan_cutoff}',"
-                f"  file_list_view => '{view}',"
-                f"  dry_run => {dry})"
-            ).collect()
-
         # DRY-RUN trước: đây là code XOÁ FILE trong lakehouse. Nếu nó định xoá một
         # lượng vô lý (vd gần bằng toàn bộ file đã liệt kê) thì gần như chắc chắn
         # logic đối chiếu sai -> BỎ QUA, để người xem lại, thà giữ rác còn hơn mất data.
-        planned = call_orphan("true")
+        planned = call_orphan(spark, table, orphan_cutoff, view, dry_run=True)
         if planned and len(planned) > 0.5 * max(listed, 1):
             print(f"{table:24s} ⚠️  BỎ QUA dọn mồ côi: định xoá {len(planned):,}/{listed:,} "
                   f"file (>50%) — nghi đối chiếu sai, cần xem lại thủ công")
             orphans = []
         else:
-            orphans = call_orphan("false")
+            orphans = call_orphan(spark, table, orphan_cutoff, view, dry_run=False)
 
         after = spark.sql(f"SELECT count(*) n FROM {fqn}.files").collect()[0]["n"]
         print(f"{table:24s} files {before:>6,} -> {after:>4,}  "

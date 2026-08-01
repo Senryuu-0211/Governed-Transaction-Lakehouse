@@ -3,7 +3,6 @@
 # Verify Phase 3 — Airflow orchestrate. Exit != 0 nếu có check fail.
 # =============================================================================
 set -uo pipefail
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKER="airflow-docker-airflow-worker-1"
 AF() { docker exec "$WORKER" airflow "$@"; }
 

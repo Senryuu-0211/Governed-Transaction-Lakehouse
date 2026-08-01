@@ -1,0 +1,19 @@
+# Profile dbt CHỈ dùng cho CI.
+#
+# `dbt parse` không mở kết nối nào — nó chỉ render Jinja, phân giải ref()/source()
+# và dựng đồ thị phụ thuộc. Nhưng dbt vẫn ĐÒI có một profile hợp lệ trước khi làm
+# việc đó, nên đây là profile tối thiểu để thoả mãn yêu cầu ấy.
+#
+# ⚠️ Đừng nhầm nó với profile thật: profile thật (`~/.dbt/profiles.yml` trên host)
+# dùng method `session` — dbt chạy TRONG tiến trình Spark, không qua Thrift server.
+# Nếu có ngày CI cần `dbt compile` hoặc `dbt build` thì profile này KHÔNG đủ, và
+# lúc đó phải hỏi lại: dựng Spark + S3 giả trong runner có thật sự chứng minh được
+# gì không, hay chỉ tạo một cổng xanh giả.
+gtl_lakehouse:
+  target: ci
+  outputs:
+    ci:
+      type: spark
+      method: session
+      schema: ci
+      host: localhost

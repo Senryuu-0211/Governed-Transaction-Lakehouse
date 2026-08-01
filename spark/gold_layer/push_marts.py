@@ -11,7 +11,6 @@ Chạy:  PYTHONPATH=spark ~/working/gtl-spark-venv/bin/python spark/gold_layer/p
 """
 
 import sys
-from pathlib import Path
 
 from gtl_session import CATALOG, PROJECT_ROOT, get_spark, load_env
 

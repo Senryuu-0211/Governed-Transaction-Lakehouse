@@ -38,7 +38,7 @@ echo "== VERIFY PHASE 5 — OBSERVABILITY =="
 echo
 echo "[1/5] Nguồn: exporter ghi được file .prom"
 check "exporter chạy không lỗi" \
-      "~/working/gtl-spark-venv/bin/python scripts/metrics_exporter.py" "metric ->"
+      "$HOME/working/gtl-spark-venv/bin/python scripts/metrics_exporter.py" "metric ->"
 check "gtl_exporter_up = 1 (mọi nguồn số liệu đều lấy được)" \
       "grep '^gtl_exporter_up ' $METRICS_DIR/gtl.prom" "gtl_exporter_up 1"
 check "có metric rủi ro #1 (WAL slot)" \

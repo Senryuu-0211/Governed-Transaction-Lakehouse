@@ -161,9 +161,28 @@ def checkpoint_offset(name: str) -> int:
     Nguồn sự thật duy nhất là file offset trong checkpoint.
     """
     d = PROJECT_ROOT / "_checkpoints" / name / "offsets"
-    files = sorted((int(f.name) for f in d.iterdir() if f.name.isdigit()))
+    files = sorted(int(f.name) for f in d.iterdir() if f.name.isdigit())
     payload = (d / str(files[-1])).read_text().splitlines()[-1]
     return sum(json.loads(payload).get(f"gtl.public.{name}", {}).values())
+
+
+def retention_margin_ratio(earliest: int, committed: int, latest: int) -> float:
+    """Bronze đang đọc tới đâu trong cửa sổ retention: 1.0 = đọc hết, 0.0 = sát mép.
+
+    VÌ SAO PHẢI LÀ TỶ LỆ, KHÔNG PHẢI SỐ MESSAGE (bẫy đã dính 01-08):
+      Đặt ngưỡng "cảnh báo khi margin < 50.000 message" nghe rất hợp lý — cho tới
+      khi gặp topic `merchants`: cả đời nó chỉ có 50 message và Bronze đã nuốt hết
+      sạch, tức là AN TOÀN TUYỆT ĐỐI, nhưng margin=50 nên nó vi phạm ngưỡng VĨNH
+      VIỄN. Một ngưỡng tuyệt đối chỉ đúng cho đúng một cỡ topic.
+      Tỷ lệ thì đúng cho topic 50 message y như cho topic 3 triệu message.
+
+    Trường hợp cửa sổ rỗng (latest == earliest, topic chưa có message nào) trả 1.0:
+    không có gì để mất thì không có gì để cảnh báo.
+    """
+    window = latest - earliest
+    if window <= 0:
+        return 1.0
+    return round((committed - earliest) / window, 4)
 
 
 def collect_kafka() -> list:
@@ -181,16 +200,8 @@ def collect_kafka() -> list:
         # nghĩa là Kafka sắp xoá event mà Bronze chưa nuốt — mất data KHÔNG báo lỗi.
         out.append(("gtl_kafka_retention_margin_msgs",
                     {"topic": topic}, committed - earliest))
-        # ...nhưng con số TUYỆT ĐỐI ở trên KHÔNG đặt ngưỡng alert được, và tôi đã
-        # dính đúng bẫy đó: `merchants` chỉ có 50 message trong cả đời topic, đã
-        # nuốt hết sạch, margin = 50 -> mọi ngưỡng kiểu "cảnh báo khi < 50.000"
-        # đều kêu VĨNH VIỄN dù topic đó hoàn toàn khoẻ mạnh.
-        # Cái thật sự cần biết là VỊ TRÍ TƯƠNG ĐỐI trong cửa sổ retention: đọc xong
-        # hết = 1.0 (an toàn tuyệt đối), sát mép sắp mất data = 0.0. Tỷ lệ này đúng
-        # cho topic 50 message y như cho topic 3 triệu message.
-        window = latest - earliest
         out.append(("gtl_kafka_retention_margin_ratio", {"topic": topic},
-                    round((committed - earliest) / window, 4) if window > 0 else 1.0))
+                    retention_margin_ratio(earliest, committed, latest)))
     return out
 
 
@@ -260,15 +271,19 @@ def collect_s3(env: dict) -> list:
 
 # --- ghi file ----------------------------------------------------------------
 HELP = {
-    "gtl_replication_slot_lag_bytes": "WAL Postgres bị giữ lại vì slot chưa consume (rủi ro #1: đầy đĩa DB nguồn)",
+    "gtl_replication_slot_lag_bytes":
+        "WAL Postgres bị giữ lại vì slot chưa consume (rủi ro #1: đầy đĩa DB nguồn)",
     "gtl_replication_slot_active": "Slot có consumer đang gắn không (0 = mồ côi, vẫn tích WAL)",
-    "gtl_reconciliation_amount_diff": "Chênh lệch tuyệt đối tổng tiền Bronze vs Gold ở lần đối soát gần nhất",
+    "gtl_reconciliation_amount_diff":
+        "Chênh lệch tuyệt đối tổng tiền Bronze vs Gold ở lần đối soát gần nhất",
     "gtl_reconciliation_row_diff": "Chênh lệch số dòng Bronze vs Gold ở lần đối soát gần nhất",
     "gtl_reconciliation_age_seconds": "Lần đối soát gần nhất cách đây bao lâu",
     "gtl_kafka_end_offset": "Offset mới nhất của topic",
     "gtl_kafka_lag_messages": "Số message Kafka đã có mà Bronze chưa cam kết",
-    "gtl_kafka_retention_margin_msgs": "Khoảng cách từ offset đang đọc tới mép retention (về 0 = sắp mất data)",
-    "gtl_kafka_retention_margin_ratio": "Vị trí tương đối trong cửa sổ retention: 1=đã nuốt hết, 0=sát mép sắp mất data",
+    "gtl_kafka_retention_margin_msgs":
+        "Khoảng cách từ offset đang đọc tới mép retention (về 0 = sắp mất data)",
+    "gtl_kafka_retention_margin_ratio":
+        "Vị trí trong cửa sổ retention: 1=đã nuốt hết, 0=sát mép sắp mất data",
     "gtl_bronze_freshness_seconds": "Tuổi lần commit gần nhất của Bronze stream",
     "gtl_s3_bytes": "Dung lượng warehouse trên S3",
     "gtl_s3_objects": "Số object trong warehouse trên S3",

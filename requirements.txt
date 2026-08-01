@@ -1,0 +1,23 @@
+# Runtime cho phía HOST (venv ~/working/gtl-spark-venv, Python 3.10 + OpenJDK 17 JRE).
+# Driver Spark chạy trên host chứ không trong container — xem .claude/CLAUDE.md.
+#
+# GHIM CỨNG phiên bản, không dùng >= :
+#   pyspark PHẢI khớp đúng 3.5.0 với các jar Iceberg/Kafka khai trong
+#   spark/gtl_session.py (PACKAGES). Lệch minor là runtime nổ ở chỗ chẳng liên
+#   quan gì tới nguyên nhân — mà lỗi Spark thì rất khó lần ngược về version.
+pyspark==3.5.0
+
+# Truy cập S3: chỉ dùng cho phần OPS (đo dung lượng, liệt kê file mồ côi, lifecycle).
+# Bản thân Spark KHÔNG đi qua boto3 — nó dùng S3FileIO của Iceberg (jar), cố ý
+# không dùng hadoop-aws để tránh xung đột version Hadoop/AWS SDK.
+boto3==1.43.59
+
+# Postgres cho push_marts (qua JDBC là chuyện của Spark) và metrics_exporter
+# (đọc pg_replication_slots + bảng đối soát).
+psycopg2-binary==2.9.12
+
+# Transform: dbt lo cấu trúc/test/docs/lineage, Spark lo execution.
+# dbt-spark chạy ở chế độ `session` — dùng chung SparkSession trong tiến trình,
+# không cần Thrift server.
+dbt-core==1.12.0
+dbt-spark==1.11.0

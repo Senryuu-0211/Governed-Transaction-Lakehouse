@@ -38,6 +38,20 @@ set_flag() { mkdir -p "$METRICS_DIR" && echo "$1" > "$METRICS_DIR/.pipeline_stat
 
 stream_pids() { pgrep -f "bronze_layer/bronze_stream.py" 2>/dev/null; }
 
+# Batch mới nhất trong một thư mục checkpoint của Spark (offsets/ hoặc commits/).
+# Duyệt bằng GLOB chứ không `ls | grep`: parse output của ls là sai về nguyên tắc
+# (tên file có ký tự lạ là hỏng) và shellcheck SC2010 chặn đúng chỗ đó.
+# So sánh bằng -gt (số học) chứ không theo thứ tự chữ: "10" phải lớn hơn "9".
+newest_batch() {
+  local dir="$1" best="" name
+  for path in "$dir"/*; do
+    name="${path##*/}"
+    [[ "$name" =~ ^[0-9]+$ ]] || continue
+    if [ -z "$best" ] || [ "$name" -gt "$best" ]; then best="$name"; fi
+  done
+  printf '%s' "$best"
+}
+
 # ---------------------------------------------------------------------------
 stop_pipeline() {
   echo "== TẮT PIPELINE =="
@@ -48,14 +62,18 @@ stop_pipeline() {
   # 1) Stream TRƯỚC: nó là thứ ghi S3 liên tục. SIGINT để Spark đóng query gọn
   #    (checkpoint được flush đúng), chỉ cưỡng chế nếu chai lì.
   echo "[1/3] dừng bronze_stream..."
-  pids=$(stream_pids)
-  if [ -n "$pids" ]; then
-    kill -INT $pids 2>/dev/null
+  # mapfile thay vì để shell tự tách chuỗi: stream có thể có nhiều PID, mà tách
+  # không dấu ngoặc là loại lỗi im lặng (một khoảng trắng lạ trong output là giết
+  # nhầm tiến trình). Mảng nói rõ ý định "đây là DANH SÁCH pid".
+  mapfile -t pids < <(stream_pids)
+  if [ ${#pids[@]} -gt 0 ]; then
+    kill -INT "${pids[@]}" 2>/dev/null
     for _ in $(seq 1 20); do
       [ -z "$(stream_pids)" ] && break
       sleep 1
     done
-    [ -n "$(stream_pids)" ] && kill -9 $(stream_pids) 2>/dev/null
+    mapfile -t stubborn < <(stream_pids)
+    [ ${#stubborn[@]} -gt 0 ] && kill -9 "${stubborn[@]}" 2>/dev/null
     echo "      đã dừng (checkpoint giữ nguyên offset)"
   else
     echo "      không chạy"
@@ -140,7 +158,7 @@ show_status() {
   if [ -n "$(stream_pids)" ]; then
     # pgrep hay báo dương tính giả -> xác nhận bằng ĐỘ TƯƠI của checkpoint commit,
     # đó mới là bằng chứng stream thực sự ghi được (bài học 26-07).
-    f=$(ls -t _checkpoints/transactions/commits/ 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1)
+    f=$(newest_batch _checkpoints/transactions/commits)
     if [ -n "$f" ]; then
       age=$(( $(date +%s) - $(stat -c %Y "_checkpoints/transactions/commits/$f") ))
       [ "$age" -lt 300 ] && echo "bronze_stream: 🟢 đang ghi (commit ${age}s trước)" \
@@ -166,7 +184,7 @@ show_status() {
   end=$(docker exec gtl-kafka /opt/kafka/bin/kafka-get-offsets.sh \
         --bootstrap-server localhost:9092 --topic gtl.public.transactions --time -1 2>/dev/null | cut -d: -f3)
   d="_checkpoints/transactions/offsets"
-  cur=$(tail -1 "$d/$(ls -t "$d" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1)" 2>/dev/null \
+  cur=$(tail -1 "$d/$(newest_batch "$d")" 2>/dev/null \
         | grep -oE '"0":[0-9]+' | grep -oE '[0-9]+$')
   [ -n "$end" ] && [ -n "$cur" ] && echo "lag Bronze  : $((end - cur)) message"
 

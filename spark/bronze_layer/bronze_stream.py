@@ -15,16 +15,13 @@ Run:  PYTHONPATH=spark ~/working/gtl-spark-venv/bin/python spark/bronze_layer/br
 Stop: Ctrl-C (checkpoints make the next start resume where this one left off)
 """
 
-import json
 import sys
 import time
 import urllib.request
-from pathlib import Path
-
-from pyspark.sql import functions as F
-from pyspark.sql.avro.functions import from_avro
 
 from gtl_session import CATALOG, KAFKA_BOOTSTRAP, PROJECT_ROOT, REGISTRY_V2, get_spark
+from pyspark.sql import functions as F
+from pyspark.sql.avro.functions import from_avro
 
 # Confluent wire format (Apicurio as-confluent=true): 1 magic byte + 4-byte schema
 # id, then the Avro payload. Skip those 5 bytes before handing bytes to from_avro.

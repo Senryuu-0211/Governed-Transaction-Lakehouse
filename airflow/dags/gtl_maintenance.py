@@ -15,9 +15,10 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from airflow import DAG
 from airflow.utils.trigger_rule import TriggerRule
 from gtl_common import VENV_PY, ssh_task
+
+from airflow import DAG
 
 default_args = {"retries": 1, "retry_delay": timedelta(minutes=5)}
 

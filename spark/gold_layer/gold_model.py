@@ -12,7 +12,7 @@ Gold sẽ làm:
 Phụ thuộc: cần Silver current-state ổn định trước → chỉ làm sau Phase 2.
 """
 
-from gtl_session import CATALOG, get_spark
+from gtl_session import get_spark
 
 # SILVER = {...}   # nguồn đọc vào của Gold (Phase 2 định nghĩa)
 # GOLD   = {...}   # Phase 3

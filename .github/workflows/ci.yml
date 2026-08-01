@@ -1,0 +1,126 @@
+# =============================================================================
+# CI cho Governed Transaction Lakehouse.
+#
+# ⭐ NGUYÊN TẮC: CI chỉ chạy được thứ KHÔNG cần hạ tầng thật.
+#   Pipeline này sống nhờ Postgres + Kafka + Debezium + Spark + S3 THẬT. Dựng lại
+#   toàn bộ trong runner GitHub là vừa chậm vừa GIẢ (S3 giả, CDC giả) — mà một cổng
+#   chất lượng dựa trên môi trường giả thì tệ hơn không có: nó xanh rồi ta yên tâm.
+#   Nên phân vai rạch ròi:
+#     · CI (ở đây)          — bắt lỗi TĨNH: cú pháp, lint, hợp đồng, secret, unit test
+#     · verify_*.sh (ở host) — bắt lỗi THẬT: chạy trên hạ tầng thật, có data thật
+#   Cái nào bắt được ở CI thì đừng để tới lúc chạy thật; cái nào chỉ lộ khi chạy
+#   thật thì đừng giả vờ CI bắt được.
+#
+# CD KHÔNG có ở đây, CÓ CHỦ ĐÍCH: đích triển khai là home server sau Tailscale,
+# runner của GitHub không tới được. Cách duy nhất là self-hosted runner — tức là
+# mở một tiến trình nhận lệnh từ Internet vào máy nhà. Không đáng cho một project
+# một người. Triển khai vẫn là `scripts/deploy_dags.sh` chạy tay trên host.
+# =============================================================================
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Push liên tiếp thì huỷ lượt cũ — không xếp hàng chờ kết quả đã lỗi thời.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  lint-python:
+    name: Lint + unit test (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"   # khớp venv trên host
+          cache: pip
+
+      # requirements-dev kéo theo pyspark (~300MB) vì gtl_session import nó ở
+      # module level. Chậm hơn nhưng THẬT: nếu requirements.txt thiếu thứ gì thì
+      # bước này đỏ — mà repo không dựng lại được cũng là một loại lỗi.
+      - name: Cài dependency
+        run: pip install -r requirements-dev.txt
+
+      - name: ruff (lint + thứ tự import)
+        run: ruff check .
+
+      - name: pytest
+        # Unit test CỐ Ý chỉ phủ logic thuần (tỷ lệ retention, định dạng .prom,
+        # phân tích .env, prefix S3). Phần chạm Postgres/Kafka/S3 thuộc verify_*.sh.
+        run: pytest
+
+  # ---------------------------------------------------------------------------
+  lint-sql:
+    name: dbt parse + lint SQL
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+
+      # `dbt parse` KHÔNG kết nối tới Spark — nó chỉ dựng manifest: render Jinja,
+      # phân giải ref()/source(), dựng đồ thị phụ thuộc. Đủ để bắt:
+      #   · lỗi cú pháp Jinja / macro gọi sai
+      #   · ref() trỏ model không tồn tại
+      #   · phụ thuộc vòng
+      # Một lỗi thiếu `with` trong audit_reconciliation.sql từng chỉ lộ lúc chạy
+      # thật (PARSE_SYNTAX_ERROR) — chính là loại bước này chặn được.
+      - name: dbt parse
+        working-directory: dbt_project
+        env:
+          # Profile giả: parse không mở kết nối, nhưng dbt vẫn đòi có profile.
+          DBT_PROFILES_DIR: ${{ github.workspace }}/.github/ci
+        run: dbt parse --no-partial-parse
+
+  # ---------------------------------------------------------------------------
+  secrets:
+    name: Quét secret
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # gitleaks cần toàn bộ lịch sử, không chỉ commit cuối
+
+      # Lý do bước này có mặt không phải "cho đủ bộ": 01-08 phát hiện secret key
+      # AWS bị in ra `ps aux` vì truyền qua Spark conf. Lỗi đó gitleaks không bắt
+      # được (nó là runtime), nhưng nó nhắc rằng credential trong repo này là rủi
+      # ro CÓ THẬT chứ không giả định — và .env chỉ cách repo đúng một lần
+      # `git add -A` bất cẩn.
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  config:
+    name: Kiểm cấu hình hạ tầng
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `docker compose config` render toàn bộ file: nội suy biến, gộp anchor,
+      # kiểm schema. Bắt được lỗi YAML và tên khoá sai mà không cần KÉO một image
+      # nào. Đây chính xác là loại lỗi "sửa compose xong mới biết sai lúc up -d".
+      - name: docker compose config
+        run: docker compose --env-file .env.example config --quiet
+
+      - name: shellcheck
+        # Script bash ở đây làm việc thật (tắt pipeline, xoá, deploy). Bài học
+        # verify_3.sh: `set -o pipefail` + `grep -q` cho exit 141 -> báo FAIL oan.
+        # Đúng loại lỗi shellcheck chỉ ra.
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck --severity=warning scripts/*.sh

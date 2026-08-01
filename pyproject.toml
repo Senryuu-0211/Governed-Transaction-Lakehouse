@@ -1,0 +1,44 @@
+# Cấu hình công cụ chất lượng. Không đóng gói project thành package — code ở đây
+# chạy như script (Spark job, exporter, tiện ích ops), không phải thư viện đi cài.
+
+[tool.ruff]
+line-length = 100          # khớp độ rộng comment đang viết trong repo
+target-version = "py310"   # venv host chạy Python 3.10
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes — biến chưa định nghĩa, import thừa
+    "I",        # isort — thứ tự import
+    "B",        # bugbear — bẫy thật (mutable default, so sánh sai kiểu)
+    "UP",       # pyupgrade
+    "S",        # bandit — bảo mật; lý do có mặt: xem chú thích S105/S106 dưới
+]
+ignore = [
+    # Bắt Exception trần trong exporter là CÓ CHỦ ĐÍCH: một nguồn số liệu chết
+    # không được phép làm chết cả exporter, nếu không ta mù đúng lúc cần nhìn nhất.
+    "BLE001",
+    # subprocess: có, exporter gọi `docker exec kafka-get-offsets.sh`. Lệnh dựng
+    # từ hằng số trong file, không nhận input người dùng, và luôn có timeout.
+    "S603", "S607",
+    # S608 "SQL injection": mọi câu SQL ở đây nội suy từ HẰNG SỐ trong chính file
+    # (tên bảng trong TABLES, tên catalog) — không có đường nào cho input ngoài
+    # chạm tới. Spark SQL cũng không có prepared statement cho tên bảng/thủ tục.
+    # Giữ rule này bật chỉ tạo 14 dòng đỏ mà không ai sửa -> làm loãng cảnh báo thật.
+    "S608",
+    # S311 random không mã hoá: faker sinh DATA GIẢ để test. Nếu chỗ nào cần ngẫu
+    # nhiên mật mã thật thì phải review riêng, không phải ở đây.
+    "S311",
+    # S310 urlopen: URL là http://localhost:8087 (Apicurio) dựng từ hằng số, không
+    # nhận scheme từ ngoài.
+    "S310",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Test được phép assert (S101) và import lộn xộn theo sys.path (E402).
+"tests/*" = ["S101", "E402"]
+"scripts/*" = ["E402"]   # sys.path.insert phải chạy TRƯỚC import nội bộ
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"

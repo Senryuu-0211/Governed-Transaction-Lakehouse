@@ -86,7 +86,7 @@ def main() -> int:
     ok = ok and code == 200
 
     _req("DELETE", f"/subjects/{PROBE}")  # dọn subject demo
-    print(f"      đã xoá subject demo")
+    print("      đã xoá subject demo")
 
     print("\nSCHEMA COMPATIBILITY ENFORCED ✅" if ok else "\nENFORCEMENT SAI ❌")
     return 0 if ok else 1

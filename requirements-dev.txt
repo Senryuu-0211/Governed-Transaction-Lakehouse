@@ -1,0 +1,11 @@
+# Công cụ kiểm tra chất lượng — chạy trên CI và trên máy dev, KHÔNG cần khi chạy
+# pipeline thật. Tách riêng để môi trường production không kéo theo thứ nó không dùng.
+-r requirements.txt
+
+pytest==9.1.1
+ruff==0.16.1
+# Lint SQL của dbt qua templater `dbt`: nó RENDER Jinja trước rồi mới soi SQL, nên
+# bắt được lỗi cú pháp trong model có macro — thứ mà lint SQL thuần không thấy.
+# Một lỗi thiếu `with` trong audit_reconciliation.sql từng chỉ lộ ra lúc chạy thật.
+sqlfluff==3.4.2
+sqlfluff-templater-dbt==3.4.2

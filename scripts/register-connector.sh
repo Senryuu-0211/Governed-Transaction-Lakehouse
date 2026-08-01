@@ -7,7 +7,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-export DEBEZIUM_PASSWORD="$(grep -E '^DEBEZIUM_PASSWORD=' .env | cut -d= -f2-)"
+# Tách khai báo và gán: `export X="$(cmd)"` luôn trả mã thoát của EXPORT (0),
+# nên .env thiếu khoá này thì script vẫn chạy tiếp với mật khẩu RỖNG và lỗi
+# chỉ lộ ra ở Debezium với một thông báo chẳng liên quan (shellcheck SC2155).
+DEBEZIUM_PASSWORD="$(grep -E '^DEBEZIUM_PASSWORD=' .env | cut -d= -f2-)"
+export DEBEZIUM_PASSWORD
 
 echo ">> chờ Kafka Connect REST (localhost:8083)..."
 until curl -sf http://localhost:8083/connectors >/dev/null 2>&1; do sleep 3; done

@@ -5,7 +5,7 @@
 # =============================================================================
 set -uo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$PROJECT_ROOT"
+cd "$PROJECT_ROOT" || exit 1
 REG=http://localhost:8087
 CC=$REG/apis/ccompat/v7
 CONN=http://localhost:8083
