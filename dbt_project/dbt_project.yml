@@ -18,6 +18,14 @@ models:
   gtl_lakehouse:
     # Mọi model materialize thành bảng ICEBERG (ACID + time-travel cho audit).
     +file_format: iceberg
+    # Iceberg ghi MỘT metadata.json mỗi commit, mỗi file chứa TOÀN BỘ lịch sử
+    # snapshot -> phình dần, và mặc định GIỮ TẤT CẢ mãi mãi. Đo thật 01-08 trên
+    # Bronze: metadata.json = 82% dung lượng bảng, data thật chỉ 13%. Mỗi lần mở
+    # bảng còn phải đọc file mới nhất -> trên S3 là egress tính tiền cho MỌI query.
+    # `expire_snapshots` KHÔNG dọn loại này; chỉ hai property dưới mới dọn.
+    +tblproperties:
+      write.metadata.delete-after-commit.enabled: "true"
+      write.metadata.previous-versions-max: "10"
     silver:
       +schema: silver
     gold:

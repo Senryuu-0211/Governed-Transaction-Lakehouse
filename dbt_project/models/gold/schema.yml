@@ -63,6 +63,15 @@ models:
         data_tests: [not_null]
       - name: updated_at
         description: Last time the banking system changed this transaction (e.g. PENDING → COMPLETED).
+      - name: is_deleted
+        description: >
+          TRUE when the source system purged the transaction. The row is kept rather than
+          dropped so the audit trail is never rewritten — every report must filter it out.
+      - name: _kafka_offset
+        description: >
+          Kafka offset of the change event this row was built from. Doubles as the
+          incremental watermark and as lineage: any figure can be traced back to the exact
+          message the source emitted.
 
   - name: dim_account
     description: >
@@ -80,7 +89,10 @@ models:
       - name: email_masked
         description: Email with local part hidden (e.g. ng***@gmail.com).
       - name: birth_year
-        description: Year of birth only — supports age analytics without exposing a birthday.
+        description: >
+          Year of birth only — supports age analytics without exposing a birthday.
+          not_null guards against a silent parsing regression emptying the column.
+        data_tests: [not_null]
       - name: age
         description: Approximate age in years, derived from birth_year.
       - name: age_band
@@ -93,6 +105,50 @@ models:
           so balances can be unrealistically negative — treat as synthetic.
       - name: opened_at
         description: When the account was opened.
+
+  - name: audit_reconciliation
+    description: >
+      Append-only reconciliation ledger — the audit evidence that money is not lost or
+      invented between the raw capture layer and the reporting layer. One row per pipeline
+      run. The Bronze side is recomputed independently from raw CDC (not reused from Silver),
+      so a transform bug cannot cancel itself out. Immutable by construction: it survives
+      Iceberg snapshot expiry and ignores `--full-refresh`, so "prove the money reconciled
+      on day X" is answerable months later with a single SELECT.
+    columns:
+      - name: run_ts
+        description: When this reconciliation was performed.
+        data_tests: [not_null]
+      - name: run_date
+        description: Calendar date of the run, for grouping evidence by day.
+      - name: window_days
+        description: >
+          How many days of freshly-ingested transactions this row proves. Reconciliation
+          covers a recent window rather than all history: each day is proven when it
+          happens and the proof is kept forever, which is both cheaper and closer to how
+          audit actually works — nobody re-proves 2019 every morning.
+      - name: watermark_offset
+        description: >
+          The Kafka offset both sides were compared at. Bronze is live and Gold is a
+          snapshot, so the two are only comparable as of a fixed point; this records
+          which point, making each row independently re-checkable.
+      - name: count_bronze
+        description: >
+          Live transactions counted from raw CDC at its final state (latest event per
+          transaction, purged ones excluded) — computed without reusing Silver.
+      - name: count_gold
+        description: Rows in fact_transactions, the table every report reads.
+      - name: count_diff
+        description: >
+          count_bronze - count_gold. Anything but zero means a transaction was lost or
+          duplicated between capture and reporting. Enforced as a gate.
+      - name: amount_bronze
+        description: Sum of amounts for transactions whose final state is COMPLETED, from raw CDC.
+      - name: amount_gold
+        description: Sum of net_amount in Gold — the same definition of "real money", computed downstream.
+      - name: amount_diff
+        description: >
+          amount_bronze - amount_gold. Anything but zero is money distorted in transform:
+          a cent that has to be chased. Enforced as a gate.
 
   - name: dim_merchant
     description: One row per merchant the bank's customers transact with.

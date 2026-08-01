@@ -103,7 +103,12 @@ models:
       - name: email_masked
         description: "Partial mask: first 2 chars of local part + full domain (e.g. ng***@gmail.com)."
       - name: birth_year
-        description: Generalized from date_of_birth — age analytics without a birthday.
+        description: >
+          Generalized from date_of_birth — age analytics without a birthday. Tested for
+          not_null because a silent parsing failure here is invisible: the column simply
+          goes empty and every age report quietly stops working (that is exactly what the
+          Avro migration caused before this test existed).
+        data_tests: [not_null]
       - name: account_type
         data_tests:
           - accepted_values: { values: ["SAVINGS", "CHECKING", "CREDIT"] }
