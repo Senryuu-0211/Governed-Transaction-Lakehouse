@@ -4,6 +4,126 @@ Nhật ký để resume nhanh sau khi context bị nén. Mới nhất ở trên.
 
 ---
 
+## 01-08-2026 (tối) — Hai lỗi nghiêm trọng lộ ra khi debug một job treo
+
+Đang chờ `maintenance.py` chạy xong thì thấy nó **đứng yên**. Kéo sợi chỉ đó ra được hai thứ,
+và cả hai đều **không phải bug logic** — chúng là những thứ code chạy đúng mọi lúc cho tới khi
+môi trường thật đụng vào.
+
+### 🔴 Job treo 1h47 ở 0% CPU — không có socket timeout
+Triệu chứng: Spark UI đứng ở `stage 14 | save at SparkBinPackDataRewriter | 0/1`, số object S3
+**không đổi** suốt hàng giờ, JVM `top` báo **0.0% CPU**.
+
+0% CPU loại trừ ngay "đang chậm" — nó đang **chờ**. `ss -tnp | grep <pid>` chỉ đúng thủ phạm:
+
+```
+ESTAB  0  1053  192.168.1.48:58782  →  52.217.80.92:443   (S3)
+              ↑ Send-Q: 1.053 byte đã gửi mà KHÔNG AI ACK
+```
+
+Kết nối TCP chết nửa chừng. AWS SDK **mặc định không đặt socket timeout** → chờ vô hạn. Job
+không ném lỗi, không chết, chỉ đứng im. Đây là **kiểu hỏng khó phát hiện nhất**, và alert
+freshness của Phase 5 cũng không bắt được vì nó canh *stream*, không canh *job batch*.
+
+Sửa trong `gtl_session.py`: `http-client.type=apache` + `socket-timeout-ms=60000` +
+`connection-timeout-ms=10000` + `connection-acquisition-timeout-ms=30000`. Tên property **lấy
+từ chính jar Iceberg 1.9.2** (`strings` trên `org/apache/iceberg/aws/*.class`) chứ không đoán —
+đoán sai thì Spark im lặng bỏ qua conf lạ và ta tưởng đã sửa.
+
+> 60s: đủ rộng cho một request S3 chậm bình thường, đủ hẹp để socket chết bị cắt và SDK retry
+> thay vì treo cả job hàng giờ.
+
+### 🔴 Secret key AWS in ra chữ thô trong `ps aux`
+Lúc chạy `ps -eo cmd` để xem JVM, secret key **hiện nguyên trong dòng lệnh**. Nguyên nhân:
+Spark đưa **MỌI** `.config(...)` vào command line của JVM con, nên
+`spark.sql.catalog.gtl.s3.secret-access-key` thành công khai với **bất kỳ user nào đăng nhập
+được máy**. Với project mô phỏng ngân hàng thì đây là lỗi không thể để.
+
+Sửa: `gtl_session.py` đặt `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` vào **biến môi trường**,
+để `DefaultCredentialsProvider` của AWS SDK tự nhặt. Biến môi trường nằm ở `/proc/<pid>/environ`
+— mặc định **chỉ chủ tiến trình đọc được**. Đã kiểm chứng: quét lại `ps` không còn secret nào.
+
+**Bonus không nhỏ:** cùng cơ chế đó chạy được với **IAM role** khi lên EC2/EKS — không sửa một
+dòng code, đúng tinh thần "đổi endpoint là lên cloud" của project.
+
+> ⚠️ Quy tắc rút ra: **không bao giờ truyền credential qua `--conf`/`.config()` của Spark.**
+> Đúng cho mọi engine có kiểu spawn tiến trình con bằng command line.
+
+### Nên đổi access key
+Key `AKIAZMRA...` đã ở dạng đọc được trên máy này một thời gian. Về nguyên tắc credential từng
+lộ thì coi như đã lộ — nên **tạo key mới trong IAM và xoá key cũ** (chỉ cần sửa `.env`, không
+đụng code). Không gấp vì máy này chỉ Mr. Senryuu dùng, nhưng nên làm cho đúng phản xạ.
+
+---
+
+## 01-08-2026 (chiều) — Phase 5: Observability (`verify_5.sh` 16/16)
+
+Ba sự cố lớn nhất của project đều **không được phát hiện bằng lỗi** — chúng hỏng trong
+im lặng: stream chết 10 tiếng (26-07), Kafka xoá 1.326.675 event (20-07), storage phình
+397GB (28-07). Phase này tồn tại để ba thứ đó không im lặng nữa.
+
+### Kiến trúc: textfile collector, KHÔNG dựng exporter daemon
+`scripts/metrics_exporter.py` (cron 2 phút) ghi `.prom` → **node_exporter đang chạy sẵn
+24/7** đọc → Prometheus → Grafana. Lý do không làm `prometheus_client` daemon: mọi số cần
+đo đều tính được bằng **một lệnh rời** (một câu SQL, một lần stat file, một lần boto3),
+không có state giữ giữa hai lần đo. Nuôi thêm daemon = thêm một thứ nữa **chết lặng lẽ**,
+mà chết lặng lẽ chính là vấn đề đang đi giải. Đánh đổi: số liệu cũ tối đa 2 phút — thừa đủ
+cho các rủi ro diễn tiến hàng chục phút tới hàng giờ.
+
+Ghi **atomic** (tmp + `os.replace`): node_exporter có thể đọc đúng lúc ta ghi; đọc phải
+file dở là collector **vứt bỏ toàn bộ file**.
+
+### 9 metric · 9 luật alert — mỗi cái ứng một sự cố có thật
+Rủi ro #1 (WAL slot >5GB, đặt DƯỚI `max_slot_wal_keep_size=10GB` để còn kịp xử) · slot mồ
+côi · freshness Bronze (26-07) · mép retention Kafka (20-07) · lag · **đối soát lệch**
+(governance — luật mà ngân hàng quan tâm nhất: tám luật kia hỏi "hạ tầng có chạy không",
+luật này hỏi "SỐ CÓ ĐÚNG KHÔNG") · S3 phình (28-07) · đĩa host 80% · **exporter chết**.
+
+Luật cuối là **ai canh người canh gác**: exporter chết thì mọi metric đứng yên, dashboard
+vẫn xanh, alert vẫn im — mù hoàn toàn mà tưởng ổn. `node_textfile_mtime_seconds` do chính
+node_exporter đo nên là điểm quan sát độc lập duy nhất.
+
+### Cờ `gtl_pipeline_enabled` — maintenance window rẻ nhất
+`pipeline.sh` hạ cờ TRƯỚC khi tắt, dựng cờ SAU CÙNG khi bật. Alert cần cổng thì thêm
+`and on() (max(gtl_pipeline_enabled) == 1)`. Không có cờ này thì mỗi đêm tắt pipeline cho
+đỡ tốn tiền S3 là sáng ra một hộp thư đầy cảnh báo **đúng nhưng vô dụng** → người ta lọc
+thư → sự cố thật cũng bị lọc. Alert về **đĩa/S3/slot KHÔNG có cổng**: chúng vẫn tính tiền
+và vẫn tích WAL kể cả khi Spark đã tắt.
+Đọc không được cờ → mặc định **1 (đang bật)**: thà báo nhầm còn hơn im vì thiếu một file.
+
+### 🐛 Hai bẫy ngưỡng, CÙNG MỘT GỐC — chỉ lộ khi chạy thật
+Cả hai đều là **áp ngưỡng TUYỆT ĐỐI lên thứ có nghĩa TƯƠNG ĐỐI**, và cả hai đều do topic/
+bảng `merchants` (cả đời 50 message, đã nuốt hết = **an toàn tuyệt đối**) làm lộ:
+1. `min(retention_margin_msgs) < 50.000` → merchants có margin=50 → **vi phạm vĩnh viễn**.
+   Sửa: đo **tỷ lệ 0..1** (đã đọc tới đâu trong cửa sổ retention) — đúng cho topic 50
+   message y như topic 3 triệu.
+2. `max(freshness) > 900` → merchants là bảng tĩnh, không còn CDC event → không còn
+   micro-batch → checkpoint **không bao giờ mới lại** → tuổi tăng vô hạn → báo động mãi mãi.
+   Sửa: **`min(freshness)`** — câu hỏi thật là "stream còn ghi được không", nên BẤT KỲ bảng
+   nào vừa commit cũng là câu trả lời.
+
+> Bài học: ngưỡng chỉ đúng khi nó đo **cùng thứ mà câu hỏi đang hỏi**. Và chúng chỉ lộ ra
+> khi nhìn TRẠNG THÁI alert sau provision, chứ không phải khi thấy "đã tạo 9 luật" rồi đi.
+
+### 🐛 `docker compose up -d` KHÔNG restart container
+Sửa 3 luật alert, chạy `up -d grafana`, kiểm API → **vẫn expr cũ**. Compose config không
+đổi thì `up -d` là no-op; container không khởi động lại nên file provisioning mới không
+được đọc — mà log vẫn in "finished to provision" (của lần cũ) nên rất dễ tưởng đã nạp.
+Phải `docker compose restart grafana`.
+
+### Đụng project khác (đã xin phép)
+`Resource-Monitoring-Dashboard`: node-exporter thêm `--collector.textfile.directory` +
+mount `~/working/metrics:ro`; grafana thêm SMTP env + thư mục dashboard riêng. Thuần **bổ
+sung**, không gỡ collector nào — đã kiểm chứng **1.354 series host còn nguyên** sau restart.
+
+### Kết quả
+`verify_5.sh` **16/16**, kiểm CHUỖI từ nguồn tới cảnh báo chứ không kiểm từng mảnh. Lúc
+chạy thật, stream đang tắt → alert `Bronze stream ngừng ghi` **firing** đúng, `lag` pending
+đúng, `retention margin` inactive đúng (sau khi sửa bẫy 1). Email chờ Mr. Senryuu điền
+Gmail App Password vào `.env` của project monitoring (`GF_SMTP_ENABLED=true`).
+
+---
+
 ## 01-08-2026 — Tối ưu chi phí S3 + sửa 3 lỗi lộ ra khi chạy thật
 
 Ngày này KHÔNG thêm tính năng mới — toàn bộ là **hệ quả của việc chuyển sang S3 thật**:

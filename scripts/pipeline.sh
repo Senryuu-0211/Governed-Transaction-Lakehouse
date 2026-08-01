@@ -27,11 +27,23 @@ DAGS=(gtl_transform gtl_maintenance)
 
 af() { docker exec "$AIRFLOW_WORKER" airflow "$@" >/dev/null 2>&1; }
 
+# Ghi cờ CHỦ ĐÍCH cho Phase 5: tắt bằng script này là "tôi cố ý tắt" -> alert im
+# lặng. Còn pipeline đang bật mà chết thì alert BẮN. Không có cờ này thì đêm nào
+# tắt cho đỡ tốn tiền S3 cũng sinh một loạt cảnh báo đúng-nhưng-vô-dụng, và người
+# ta sẽ tập thói quen phớt lờ alert.
+# Chỉ ghi file trạng thái, KHÔNG ghi thẳng .prom — file đó do metrics_exporter.py
+# độc quyền ghi (hai người ghi = có lúc node_exporter đọc phải file dở).
+METRICS_DIR="${GTL_METRICS_DIR:-$HOME/working/metrics}"
+set_flag() { mkdir -p "$METRICS_DIR" && echo "$1" > "$METRICS_DIR/.pipeline_state"; }
+
 stream_pids() { pgrep -f "bronze_layer/bronze_stream.py" 2>/dev/null; }
 
 # ---------------------------------------------------------------------------
 stop_pipeline() {
   echo "== TẮT PIPELINE =="
+  # Hạ cờ TRƯỚC khi tắt: đặt sau thì có một khoảng stream đã chết mà cờ còn =1 ->
+  # đúng khoảnh khắc đó exporter chạy là bắn cảnh báo oan.
+  set_flag 0
 
   # 1) Stream TRƯỚC: nó là thứ ghi S3 liên tục. SIGINT để Spark đóng query gọn
   #    (checkpoint được flush đúng), chỉ cưỡng chế nếu chai lì.
@@ -106,6 +118,10 @@ start_pipeline() {
     [ -n "$(stream_pids)" ] && echo "      đang chạy (log: $STREAM_LOG)" \
                            || echo "      ⚠️ chưa lên — xem $STREAM_LOG"
   fi
+
+  # Dựng cờ SAU CÙNG: stream vừa lên cần vài chục giây mới có commit đầu, dựng cờ
+  # sớm là alert freshness bắn ngay trong lúc khởi động bình thường.
+  set_flag 1
 
   echo
   echo "✅ ĐÃ BẬT. Kiểm: bash scripts/pipeline.sh status"

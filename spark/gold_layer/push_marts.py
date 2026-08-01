@@ -16,6 +16,11 @@ from pathlib import Path
 from gtl_session import CATALOG, PROJECT_ROOT, get_spark, load_env
 
 MARTS = ["mart_daily_volume", "mart_channel_daily", "mart_category_daily"]
+# Sổ đối soát nằm ở schema `gold`, không phải `marts` — nhưng vẫn đẩy sang Postgres
+# vì Phase 5: exporter Prometheus cần đọc chênh lệch mỗi 2 phút. Đọc thẳng Iceberg
+# thì phải dựng SparkSession ~40s + tốn egress S3 mỗi lần đo -> vô lý. Ở đây đã có
+# sẵn một Spark session đang chạy nên đẩy kèm là gần như miễn phí.
+AUDIT = [("gold", "audit_reconciliation")]
 POSTGRES_JAR = PROJECT_ROOT / "jars" / "postgresql-42.7.4.jar"
 # Chạy từ host nên nói chuyện với Postgres qua cổng published 5433.
 JDBC_URL = "jdbc:postgresql://localhost:5433/marts"
@@ -36,8 +41,8 @@ def main() -> int:
         extra_conf={"spark.jars": str(POSTGRES_JAR)},
     )
 
-    for name in MARTS:
-        df = spark.table(f"{CATALOG}.marts.{name}")
+    for schema, name in [("marts", m) for m in MARTS] + AUDIT:
+        df = spark.table(f"{CATALOG}.{schema}.{name}")
         # overwrite + truncate=true: giữ nguyên bảng (và quyền SELECT của marts_ro),
         # chỉ thay ruột — thay vì drop/create làm rớt grant.
         (
@@ -45,7 +50,7 @@ def main() -> int:
             .option("truncate", "true")
             .jdbc(JDBC_URL, name, properties=props)
         )
-        print(f"pushed {name}: {df.count():,} rows")
+        print(f"pushed {schema}.{name}: {df.count():,} rows")
 
     spark.stop()
     print("DONE — marts đã sang Postgres cho Superset")

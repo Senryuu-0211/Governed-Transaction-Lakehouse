@@ -88,7 +88,7 @@ average *is* the small-files problem), and estimated monthly cost.
 | 2 — Medallion transform | Gold star schema + dbt structural tests (quality as a gate), correct REVERSAL |
 | 3 — Orchestration | Airflow-driven, idempotent, backfillable |
 | 4 — Advanced governance | Time-travel audit, lineage, reconciliation, Great Expectations, PII masking |
-| 5 — Observability | Lag/freshness dashboards + alerting |
+| 5 — Observability | Lag/freshness dashboards + alerting, gated by a maintenance-window flag |
 | 6 — CI/CD + LocalStack | Automated deploy; cloud code runs $0 on LocalStack |
 | Part 2 — Real AWS | S3 + Glue + Athena (endpoint swap) |
 
@@ -109,6 +109,20 @@ average *is* the small-files problem), and estimated monthly cost.
   Spark/dbt** (Airflow orchestrates, the host computes); `dbt_test` **gates** `push_marts` so bad
   data never reaches Superset; `verify_3.sh` 6/6 and a full end-to-end run green (dbt 11 models,
   71 tests, marts refreshed)
+- ✅ **Phase 4** — Advanced governance: append-only `audit_reconciliation` ledger reconciled
+  **as of a watermark** (Silver's `max(_kafka_offset)`) rather than live-vs-frozen — the naive
+  version reported a $129M gap that was entirely an artifact of Bronze moving while Gold stood
+  still; fact table converted to **incremental MERGE** carrying `is_deleted`; **two-tier**
+  anomaly severity (`warn_if` / `error_if`) benchmarked against each table's own history;
+  PII masking + a `not_null` test that caught a silent regression which had nulled `birth_year`
+  for every account for days. `verify_4.py` 13/13
+- ✅ **Phase 5** — Observability: pipeline health metrics exported to a `.prom` file read by the
+  **node_exporter already running 24/7** (textfile collector) → Prometheus → Grafana, with a
+  `GTL · Pipeline Health` dashboard and **9 alert rules**, each one tied to an incident that
+  actually happened rather than to a round number. A `gtl_pipeline_enabled` flag written by
+  `pipeline.sh` acts as a maintenance window, so deliberately shutting the pipeline down to save
+  S3 cost stays silent while an unplanned death still pages. `verify_5.sh` 16/16 —
+  see **[docs/observability.md](docs/observability.md)**
 
 ### Step 1a highlights
 - `wal_level=logical` with replication slots ready for Debezium
