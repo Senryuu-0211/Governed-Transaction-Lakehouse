@@ -1,10 +1,12 @@
-# Spark conf cho dbt session mode (nạp qua SPARK_CONF_DIR trong scripts/dbt.sh).
+# TEMPLATE — scripts/dbt.sh render file này thành spark-defaults.conf (gitignored)
+# rồi trỏ SPARK_CONF_DIR vào đó. Lý do dùng template: Spark KHÔNG nội suy biến môi
+# trường trong spark-defaults.conf, mà tên bucket S3 không nên nằm trong repo public.
 # KHÔNG chứa secret: credentials S3 đi qua env AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY
 # (S3FileIO đọc theo AWS default credential chain).
 # Version Iceberg 1.9.2 PHẢI khớp spark/gtl_session.py + image iceberg-rest (điểm hỏng số 1).
 
 # local[6]: transform MERGE nặng nhưng ngắn. Không lấy hết 16 luồng để stream(3)
-# + container (Kafka/Postgres/MinIO/Superset) + OS còn chỗ thở.
+# + container (Kafka/Postgres/Superset) + OS còn chỗ thở.
 spark.master                                 local[6]
 spark.driver.memory                          5g
 # Stream Bronze đang giữ 4040 — tắt UI cho job dbt để khỏi dò port.
@@ -16,9 +18,14 @@ spark.sql.extensions                         org.apache.iceberg.spark.extensions
 spark.sql.catalog.gtl                        org.apache.iceberg.spark.SparkCatalog
 spark.sql.catalog.gtl.type                   rest
 spark.sql.catalog.gtl.uri                    http://localhost:8181
-spark.sql.catalog.gtl.warehouse              s3://warehouse/
+# 28-07: S3 THẬT (bỏ MinIO) — không còn s3.endpoint / path-style-access.
+spark.sql.catalog.gtl.warehouse              s3://__S3_BUCKET__/warehouse/
 spark.sql.catalog.gtl.io-impl                org.apache.iceberg.aws.s3.S3FileIO
-spark.sql.catalog.gtl.s3.endpoint            http://localhost:9001
-spark.sql.catalog.gtl.s3.path-style-access   true
-spark.sql.catalog.gtl.client.region          us-east-1
+spark.sql.catalog.gtl.client.region          __AWS_REGION__
 spark.sql.defaultCatalog                     gtl
+
+# Derby metastore RIÊNG cho mỗi lần chạy (scripts/dbt.sh render vào thư mục tạm).
+# Derby chỉ cho MỘT tiến trình mở database -> dùng chung thì hai lần chạy dbt song
+# song (DAG hourly + DAG daily, hoặc DAG + chạy tay) sẽ chết XSDB6. An toàn vì
+# catalog thật là Iceberg REST; Derby chỉ là session catalog mặc định, gần như không dùng.
+spark.driver.extraJavaOptions                -Dderby.system.home=__DERBY_HOME__

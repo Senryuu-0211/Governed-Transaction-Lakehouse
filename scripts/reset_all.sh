@@ -38,7 +38,7 @@ echo " RESET TOÀN BỘ — CÁC THỨ SAU SẼ BỊ XOÁ VĨNH VIỄN"
 echo "=============================================================="
 echo "  1. Postgres  : toàn bộ accounts / merchants / transactions"
 echo "  2. Kafka     : toàn bộ topic + offset + replication slot state"
-echo "  3. MinIO     : toàn bộ bảng Bronze (bucket warehouse)"
+echo "  3. AWS S3    : toàn bộ prefix warehouse/ trên bucket THẬT (Bronze/Silver/Gold)"
 echo "  4. Host      : $PROJECT_ROOT/iceberg-catalog/  (catalog sqlite)"
 echo "                 $PROJECT_ROOT/_checkpoints/      (offset của Spark)"
 echo
@@ -74,9 +74,17 @@ else
 fi
 
 # --- Bước 2: hạ stack + xoá named volume ------------------------------------
-echo "[2/5] hạ stack và xoá volume (Postgres, Kafka, MinIO)..."
+echo "[2/5] hạ stack và xoá volume (Postgres, Kafka)..."
 docker compose down -v >/dev/null 2>&1
 echo "      xong"
+
+# --- Bước 2b: dọn S3 ---------------------------------------------------------
+# 28-07: storage chuyển sang S3 THẬT -> `down -v` KHÔNG còn xoá data lakehouse
+# (trước đây nó xoá volume MinIO). Phải dọn tường minh, nếu không data cũ ở lại
+# S3: sai trạng thái sau reset VÀ tính tiền mãi.
+echo "[2b/5] xoá prefix warehouse/ trên S3..."
+"${VENV_PYTHON:-$HOME/working/gtl-spark-venv/bin/python}" \
+    "$PROJECT_ROOT/scripts/s3_admin.py" purge || echo "      ⚠️ không dọn được S3 (kiểm .env/IAM)"
 
 # --- Bước 3: dọn state trên host --------------------------------------------
 # Hai thư mục này `down -v` KHÔNG chạm tới. Đây là bước hay bị quên nhất.
@@ -119,6 +127,24 @@ done
 echo "[5/5] đăng ký lại Debezium connector (Avro)..."
 bash "$PROJECT_ROOT/scripts/register-connector.sh" >/dev/null 2>&1 \
   && echo "      xong" || echo "      ⚠️  đăng ký thất bại, chạy tay: bash scripts/register-connector.sh"
+
+# Reset xoá metadata Superset -> 3 dataset marts phải đăng ký lại. Trước đây làm
+# TAY sau mỗi reset (hay quên, verify_2 fail vì nó) -> script hoá luôn ở đây.
+# Chạy sau khi push_marts có bảng thì dataset mới trỏ được; nếu chạy sớm sẽ báo
+# lỗi vô hại và ta chạy lại tay sau.
+# Reset cũng xoá topic kafkasql của Apicurio -> compatibility level BACKWARD trên
+# 3 subject bay theo (verify_2_5 fail). Script này vừa hardening vừa tự test.
+echo "      đặt lại compatibility BACKWARD cho schema..."
+"${VENV_PYTHON:-$HOME/working/gtl-spark-venv/bin/python}" \
+    "$PROJECT_ROOT/scripts/test_schema_compat.py" >/dev/null 2>&1 \
+  && echo "      xong" || echo "      ⚠️  chạy tay: python scripts/test_schema_compat.py"
+
+echo "      đăng ký dataset Superset..."
+"${VENV_PYTHON:-$HOME/working/gtl-spark-venv/bin/python}" \
+    "$PROJECT_ROOT/scripts/register_superset_datasets.py" >/dev/null 2>&1 \
+  && echo "      xong" \
+  || echo "      ℹ️  chưa đăng ký được (bảng marts chưa tồn tại) — chạy sau push_marts:
+         python scripts/register_superset_datasets.py"
 
 cat <<EOF
 

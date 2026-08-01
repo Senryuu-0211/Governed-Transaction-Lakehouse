@@ -4,15 +4,24 @@ name: governed-txn-lakehouse
 # Phase 1 — hạ tầng CDC + lakehouse (chạy local, $0)
 #   1a: postgres (logical replication) + faker  -> NGUỒN mà CDC đọc
 #   1b: kafka (KRaft) + connect (Debezium) + kafka-ui  -> bắt & đệm change event
-#   1c: minio (S3 API) + iceberg-rest  -> nơi Bronze đáp xuống
+#   1c: AWS S3 (bucket thật) + iceberg-rest  -> nơi Bronze đáp xuống
 # Spark KHÔNG nằm ở đây: driver chạy venv trên host (local[*]) và nối vào qua
 # các cổng published — xem docs/phase-1c-bronze-design.md.
 # =============================================================================
+
+# 28-07: giới hạn log MỌI container (bài học đĩa đầy 397GB — log không giới hạn
+# cũng là một nguồn phình âm thầm). 10MB × 3 file = tối đa 30MB/container.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
 
 services:
   postgres:
     image: postgres:16
     container_name: gtl-postgres
+    logging: *default-logging
     # ---- Logical replication (nền của CDC không mất event) ----
     # Debezium (Step 1b) đọc Write-Ahead Log qua 1 logical replication slot để bắt
     # MỌI thay đổi hàng (INSERT/UPDATE/DELETE) theo đúng thứ tự commit. Không có
@@ -59,6 +68,7 @@ services:
   faker:
     build: ./faker
     container_name: gtl-faker
+    logging: *default-logging
     environment:
       PGHOST: postgres
       PGPORT: "5432"          # trong network dùng cổng nội bộ 5432 (5433 chỉ là map ra host)
@@ -82,6 +92,7 @@ services:
   kafka:
     image: apache/kafka:3.8.1
     container_name: gtl-kafka
+    logging: *default-logging
     hostname: kafka
     ports:
       - "9093:9093"   # EXTERNAL listener cho tool ở host; nội bộ dùng kafka:9092
@@ -114,6 +125,7 @@ services:
   connect:
     image: quay.io/debezium/connect:2.7
     container_name: gtl-connect
+    logging: *default-logging
     hostname: connect
     ports:
       - "8083:8083"   # Connect REST API (đăng ký/giám sát connector)
@@ -145,6 +157,7 @@ services:
   kafka-ui:
     image: provectuslabs/kafka-ui:v0.7.2
     container_name: gtl-kafka-ui
+    logging: *default-logging
     ports:
       - "8092:8080"
     environment:
@@ -162,76 +175,37 @@ services:
           memory: 512M
     restart: unless-stopped
 
-  # ---- MinIO: object store nói giao thức S3 ---------------------------------
-  # Đây là mấu chốt của cả thiết kế: Spark/Iceberg chạm storage qua S3 API chứ
-  # KHÔNG qua filesystem trần. Phần 2 lên AWS chỉ đổi endpoint + credential, code
-  # y nguyên. Cổng 9000 đã bận (Project 1) nên S3 API map ra host 9001.
-  minio:
-    image: minio/minio:RELEASE.2024-09-13T20-26-02Z
-    container_name: gtl-minio
-    hostname: minio
-    command: server /data --console-address ":9002"
-    ports:
-      - "9001:9000"   # S3 API  -> Spark ở host trỏ http://localhost:9001
-      - "9002:9002"   # Console web (soi bucket/file bằng mắt)
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-    volumes:
-      - minio-data:/data
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    deploy:
-      resources:
-        limits:
-          # 24-07: 512M nghẹt (86%) khi stream + dbt build + push chạy song song
-          # -> AWS SDK "Connection reset". MinIO giờ là kho trung tâm cả pipeline.
-          memory: 1536M
-    restart: unless-stopped
-
-  # ---- Tạo bucket warehouse (chạy 1 lần rồi thoát, idempotent) --------------
-  # Iceberg cần bucket tồn tại sẵn; nó không tự tạo. Job này chạy mỗi lần `up`
-  # nhưng `--ignore-existing` nên lặp lại vô hại.
-  minio-init:
-    image: minio/mc:RELEASE.2024-09-16T17-43-14Z
-    container_name: gtl-minio-init
-    depends_on:
-      minio:
-        condition: service_healthy
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set gtl http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
-      mc mb --ignore-existing gtl/warehouse &&
-      echo 'bucket warehouse san sang'
-      "
-    restart: "no"
+  # ---- STORAGE = AWS S3 THẬT (28-07: bỏ hẳn MinIO) --------------------------
+  # Trước đây MinIO (S3 API) chạy như container tại đây. Đã LOẠI BỎ HOÀN TOÀN sau
+  # sự cố đĩa đầy 397GB (xem .claude/CLAUDE.md) + quyết định dùng S3 thật cho đúng
+  # thực tế production. Storage giờ là một bucket S3 thật (tên + region lấy từ
+  # `.env`: S3_BUCKET / AWS_DEFAULT_REGION — không hard-code vào file versioned),
+  # truy cập bằng IAM user least-privilege chỉ có quyền trên đúng bucket đó.
+  # ⚠️ TIỀN THẬT: mỗi file ghi = 1 PUT request tính phí -> small-files không chỉ
+  # phình đĩa mà ĐỐT VÍ. Vì vậy trigger stream 30s + compaction + expire +
+  # remove_orphan_files + lifecycle rule là BẮT BUỘC, không phải tuỳ chọn.
 
   # ---- Iceberg REST catalog -------------------------------------------------
   # Catalog giữ con trỏ "bảng nào -> file metadata nào" và bảo đảm commit ACID.
   # Dùng REST (chuẩn mở, engine-agnostic) để Phần 2 thay bằng AWS Glue chỉ là đổi
   # catalog impl. Metadata lưu sqlite trên volume => sống sót qua restart; còn
-  # metadata/data file thật của Iceberg thì nằm trên MinIO.
+  # metadata/data file thật của Iceberg thì nằm trên S3 (bucket ${S3_BUCKET}).
   # LƯU Ý version: phải TRÙNG dòng Iceberg mà Spark dùng (1.9.2) - đây là điểm
   # hỏng số 1 của bước này. 1.9.2 là giao của "image fixture có phát hành" và
   # "iceberg-spark-runtime-3.5_2.12 + iceberg-aws-bundle có trên Maven".
   iceberg-rest:
     image: apache/iceberg-rest-fixture:1.9.2
     container_name: gtl-iceberg-rest
+    logging: *default-logging
     hostname: iceberg-rest
     ports:
       - "8181:8181"
     environment:
       # Quy ước biến: CATALOG_ + tên; "__" -> "-", "_" -> "."
-      CATALOG_WAREHOUSE: s3://warehouse/
+      # S3 THẬT: warehouse = prefix trong bucket. KHÔNG set s3.endpoint (SDK tự dùng
+      # endpoint AWS theo region) và KHÔNG path-style (S3 thật dùng virtual-host style).
+      CATALOG_WAREHOUSE: s3://${S3_BUCKET}/warehouse/
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
-      CATALOG_S3_ENDPOINT: http://minio:9000
-      CATALOG_S3_PATH__STYLE__ACCESS: "true"
       CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
       # Backend catalog = POSTGRES (db riêng `iceberg_catalog`, KHÔNG đụng db banking).
       # Lịch sử: SQLite cắn 2 lần trong 2 ngày — SQLITE_BUSY (nhiều writer, 22-07) rồi
@@ -242,10 +216,10 @@ services:
       CATALOG_URI: "jdbc:postgresql://postgres:5432/iceberg_catalog"
       CATALOG_JDBC_USER: ${POSTGRES_USER}
       CATALOG_JDBC_PASSWORD: ${POSTGRES_PASSWORD}
-      # S3FileIO đọc credential theo chuẩn AWS -> dùng chính key của MinIO.
-      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
-      AWS_REGION: us-east-1
+      # S3FileIO đọc credential theo chuẩn AWS -> IAM user least-privilege (1 bucket).
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_REGION: ${AWS_DEFAULT_REGION}
     volumes:
       # Image không bundle driver Postgres -> mount jar rồi chạy bằng -cp (xem command).
       - ./jars/postgresql-42.7.4.jar:/opt/jars/postgresql.jar:ro
@@ -256,8 +230,6 @@ services:
     # minh 1g (trong mem_limit 1536M bên dưới) để catalog chịu được commit đồng thời.
     command: ["java", "-Xmx1g", "-cp", "iceberg-rest-adapter.jar:/opt/jars/postgresql.jar", "org.apache.iceberg.rest.RESTCatalogServer"]
     depends_on:
-      minio:
-        condition: service_healthy
       postgres:
         condition: service_healthy
     deploy:
@@ -275,6 +247,7 @@ services:
   apicurio:
     image: apicurio/apicurio-registry-kafkasql:2.6.13.Final
     container_name: gtl-apicurio
+    logging: *default-logging
     hostname: apicurio
     ports:
       - "8087:8080"   # 8081 bận (Airflow P1), 8181 iceberg-rest -> chọn 8087
@@ -302,6 +275,7 @@ services:
     build: ./superset          # apache/superset:4.1.1 + psycopg2-binary
     image: gtl-superset:4.1.1
     container_name: gtl-superset
+    logging: *default-logging
     ports:
       - "8088:8088"
     environment:
@@ -326,4 +300,5 @@ services:
 volumes:
   pgdata:
   kafka-data:
-  minio-data:
+  # minio-data: ĐÃ XOÁ 28-07 — storage giờ là S3 thật, không còn volume local
+  # (volume cũ từng phình 397GB làm đầy ổ; xem BÀI HỌC VẬN HÀNH trong .claude/CLAUDE.md)

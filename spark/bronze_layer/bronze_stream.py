@@ -98,6 +98,19 @@ BRONZE_COLUMNS = """
 """
 
 
+# Iceberg ghi MỘT metadata.json mới cho MỖI commit, và mỗi file chứa TOÀN BỘ lịch
+# sử snapshot -> file sau to hơn file trước. Mặc định Iceberg GIỮ TẤT CẢ mãi mãi.
+# Với stream trigger 30s (2.880 commit/ngày) điều này bùng nổ: đo thật ngày 01-08
+# thấy metadata.json chiếm 1.217MB = 82% dung lượng bảng, trong khi DATA thật chỉ
+# 190MB = 13%. Tệ hơn: MỖI lần mở bảng đều phải đọc metadata.json mới nhất (760KB
+# và phình dần) -> trên S3 là egress TÍNH TIỀN cho mọi truy vấn.
+# ⚠️ `expire_snapshots` KHÔNG dọn loại file này — chỉ hai property dưới mới dọn.
+TABLE_PROPERTIES = {
+    "write.metadata.delete-after-commit.enabled": "true",
+    "write.metadata.previous-versions-max": "10",
+}
+
+
 def ensure_table(spark, source):
     """Create the Bronze table if it does not exist yet.
 
@@ -108,6 +121,10 @@ def ensure_table(spark, source):
         f"CREATE TABLE IF NOT EXISTS {source['table']} ({BRONZE_COLUMNS}) "
         f"USING iceberg {source['partition_by']}"
     )
+    # Áp cả cho bảng đã tồn tại (ALTER idempotent) — bảng cũ tạo trước khi có
+    # property này vẫn phải được vá, không chỉ bảng tạo mới.
+    for key, value in TABLE_PROPERTIES.items():
+        spark.sql(f"ALTER TABLE {source['table']} SET TBLPROPERTIES ('{key}'='{value}')")
 
 
 def build_stream(spark, source):
@@ -188,12 +205,14 @@ def main() -> int:
             # Checkpoints stay on the local disk. They are small, they are
             # written on every batch, and a single driver does not need them on
             # object storage -- where rename semantics make them fragile. The
-            # Bronze data itself lives on MinIO.
+            # Bronze data itself lives on S3.
             .option("checkpointLocation", str(checkpoint))
             .option("fanout-enabled", "true")
-            # Five seconds is near-real-time for this workload and keeps the
-            # driver from spinning on an idle topic.
-            .trigger(processingTime="5 seconds")
+            # 28-07: 5s -> 30s. Mỗi micro-batch đẻ file mới, và trên S3 THẬT mỗi
+            # file ghi = 1 PUT request TÍNH TIỀN (chưa kể small-files làm dbt quét
+            # chậm và từng phình 397GB trên MinIO). 30s vẫn là near-real-time cho
+            # workload này nhưng giảm ~6x số file/PUT. Đổi số này = đổi hoá đơn.
+            .trigger(processingTime="30 seconds")
             .toTable(source["table"])
         )
         queries.append((source["name"], query))
