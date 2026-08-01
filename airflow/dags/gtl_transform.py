@@ -24,8 +24,20 @@ with DAG(
 ) as dag:
     # Health check không retry: stream chết thì báo đỏ NGAY, đừng trì hoãn.
     cdc_health = ssh_task("cdc_health", CDC_HEALTH_CMD, cmd_timeout=120, retries=0)
-    dbt_run = ssh_task("dbt_run", "bash scripts/dbt.sh run")
-    dbt_test = ssh_task("dbt_test", "bash scripts/dbt.sh test")
+    # LOẠI reconciliation khỏi nhịp hourly (01-08): nó quét Bronze theo cửa sổ, mà
+    # compute chạy on-prem nên mỗi lần đọc S3 là data-transfer-out TÍNH TIỀN.
+    # Hourly ≈ 720 lần/tháng là lãng phí — đối soát là chứng cứ kiểm toán, mỗi ngày
+    # một lần là đủ. Nó chạy trong gtl_maintenance (00:00 UTC = 07:00 sáng VN).
+    # pool `gtl_dbt` (1 slot) xếp hàng MỌI task chạy dbt trên toàn bộ Airflow.
+    # Vì sao cần dù đã cô lập Derby: mỗi dbt lấy local[6]; hai cái cùng chạy + stream
+    # local[3] = 15/16 luồng -> vỡ core budget, cả hai cùng bò. Derby fix lo tính
+    # ĐÚNG ĐẮN (chạy được), pool lo TRẬT TỰ TÀI NGUYÊN (chạy lần lượt).
+    # Thấy rõ nhất lúc 00:00 UTC: gtl_transform (@hourly) và gtl_maintenance (@daily)
+    # cùng nổ một lúc.
+    dbt_run = ssh_task("dbt_run", "bash scripts/dbt.sh run --exclude audit_reconciliation",
+                       pool="gtl_dbt")
+    dbt_test = ssh_task("dbt_test", "bash scripts/dbt.sh test --exclude assert_reconciliation",
+                        pool="gtl_dbt")
     push_marts = ssh_task(
         "push_marts", f"PYTHONPATH=spark {VENV_PY} spark/gold_layer/push_marts.py"
     )
