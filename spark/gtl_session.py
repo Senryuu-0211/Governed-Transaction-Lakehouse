@@ -11,6 +11,7 @@ Both the streaming job and the smoke test build their session from here, so the
 jar versions and catalog wiring can never drift apart between them.
 """
 
+import os
 from pathlib import Path
 
 from pyspark.sql import SparkSession
@@ -72,10 +73,15 @@ def get_spark(
     extra_conf: dict = None,
 ) -> SparkSession:
     env = load_env()
-    access_key = env["AWS_ACCESS_KEY_ID"]
-    secret_key = env["AWS_SECRET_ACCESS_KEY"]
     region = env.get("AWS_DEFAULT_REGION", "us-east-1")
     warehouse = f"s3://{env['S3_BUCKET']}/warehouse/"
+
+    # Nạp credential vào MÔI TRƯỜNG, không vào Spark conf (xem lý do ở phần config
+    # bên dưới). JVM con kế thừa môi trường này, DefaultCredentialsProvider của AWS
+    # SDK đọc đúng ba biến chuẩn dưới đây.
+    os.environ.setdefault("AWS_ACCESS_KEY_ID", env["AWS_ACCESS_KEY_ID"])
+    os.environ.setdefault("AWS_SECRET_ACCESS_KEY", env["AWS_SECRET_ACCESS_KEY"])
+    os.environ.setdefault("AWS_REGION", region)
 
     builder = (
         SparkSession.builder.appName(app_name)
@@ -98,9 +104,29 @@ def get_spark(
         .config(f"spark.sql.catalog.{CATALOG}.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
         # S3 thật: KHÔNG set s3.endpoint (SDK tự resolve theo region) và KHÔNG
         # path-style — bucket được địa chỉ hoá theo virtual-host style.
-        .config(f"spark.sql.catalog.{CATALOG}.s3.access-key-id", access_key)
-        .config(f"spark.sql.catalog.{CATALOG}.s3.secret-access-key", secret_key)
+        # ⚠️ CREDENTIAL KHÔNG truyền qua `.config(...s3.secret-access-key)`.
+        # Spark đưa MỌI conf vào DÒNG LỆNH của JVM -> `ps aux` in ra secret key
+        # dạng chữ thô, ai đăng nhập được máy này cũng đọc được (đã tận mắt thấy
+        # 01-08 khi debug job treo). Thay vào đó đặt biến môi trường và để
+        # DefaultCredentialsProvider của AWS SDK tự nhặt: biến môi trường chỉ nằm
+        # trong /proc/<pid>/environ, mặc định chỉ CHỦ tiến trình đọc được.
+        # Bonus: cùng cơ chế này chạy được với IAM role khi lên EC2/EKS sau này —
+        # không phải sửa code, đúng tinh thần "đổi endpoint là lên cloud".
         .config(f"spark.sql.catalog.{CATALOG}.client.region", region)
+        # --- Timeout: BẮT BUỘC cho job dài chạm S3 ---------------------------
+        # SỰ CỐ 01-08: maintenance treo 1h47 ở 0% CPU. Không phải chậm — một kết
+        # nối TCP tới S3 chết nửa chừng (Send-Q còn 1.053 byte chưa ai ACK), mà
+        # mặc định KHÔNG có socket timeout nên SDK chờ vô hạn. Job không lỗi,
+        # không chết, chỉ đứng im — kiểu hỏng khó phát hiện nhất.
+        # 60s: đủ rộng cho một request S3 chậm bình thường, đủ hẹp để một socket
+        # chết bị cắt và SDK retry thay vì treo cả job hàng giờ.
+        .config(f"spark.sql.catalog.{CATALOG}.http-client.type", "apache")
+        .config(f"spark.sql.catalog.{CATALOG}.http-client.apache.socket-timeout-ms", "60000")
+        .config(f"spark.sql.catalog.{CATALOG}.http-client.apache.connection-timeout-ms", "10000")
+        .config(
+            f"spark.sql.catalog.{CATALOG}.http-client.apache.connection-acquisition-timeout-ms",
+            "30000",
+        )
         .config("spark.sql.defaultCatalog", CATALOG)
     )
     # Job đặc thù (vd push mart qua JDBC cần driver Postgres) truyền conf thêm ở
