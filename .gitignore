@@ -45,3 +45,6 @@ derby.log
 spark-warehouse/
 # dbt user-local (UUID anonymous tracking, máy-riêng)
 dbt_project/.user.yml
+
+# Sinh từ spark-defaults.conf.tmpl bởi scripts/dbt.sh (chứa tên bucket S3)
+dbt_project/spark-conf/spark-defaults.conf

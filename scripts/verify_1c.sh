@@ -13,7 +13,6 @@ set -uo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_PYTHON="${VENV_PYTHON:-$HOME/working/gtl-spark-venv/bin/python}"
-MINIO_URL="${MINIO_URL:-http://localhost:9001}"
 CATALOG_URL="${CATALOG_URL:-http://localhost:8181}"
 KAFKA="${KAFKA_CONTAINER:-gtl-kafka}"
 KBIN=/opt/kafka/bin
@@ -40,17 +39,30 @@ stream_offset() {  # $1=table -> vị trí stream đã commit theo checkpoint
 
 echo "== Phase 1 Step 1c — verify =="
 
-# --- 1. MinIO sống ----------------------------------------------------------
-code=$(curl -s -o /dev/null -w '%{http_code}' "$MINIO_URL/minio/health/live" 2>/dev/null)
-[ "$code" = "200" ] && ok "MinIO healthy ($MINIO_URL)" || no "MinIO không phản hồi (HTTP ${code:-none})"
-
-# --- 2. Bucket warehouse tồn tại --------------------------------------------
-# Hứng output ra biến RỒI mới grep: `docker` thoát mã != 0 sẽ đầu độc exit code
-# của pipeline và làm grep báo sai âm (bài học từ verify.sh).
-buckets=$(docker run --rm --network governed-txn-lakehouse_default --entrypoint sh \
-            --env-file "$PROJECT_ROOT/.env" minio/mc:RELEASE.2024-09-16T17-43-14Z -c \
-            'mc alias set gtl http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; mc ls gtl/' 2>/dev/null)
-printf '%s\n' "$buckets" | grep -q "warehouse" && ok "bucket warehouse tồn tại" || no "không thấy bucket warehouse"
+# --- 1+2. S3 THẬT: bucket tồn tại + IAM đủ quyền (28-07: thay MinIO) ---------
+# Hứng output ra biến RỒI mới kiểm: lệnh con thoát != 0 sẽ đầu độc exit code của
+# pipeline và làm grep báo sai âm (bài học từ verify.sh).
+s3check=$("$VENV_PYTHON" - <<'PY' 2>/dev/null
+import boto3, pathlib
+env = {}
+for line in pathlib.Path(".env").read_text().splitlines():
+    line = line.strip()
+    if line and not line.startswith("#") and "=" in line:
+        k, v = line.split("=", 1); env[k.strip()] = v.strip()
+try:
+    s3 = boto3.client("s3", region_name=env["AWS_DEFAULT_REGION"],
+                      aws_access_key_id=env["AWS_ACCESS_KEY_ID"],
+                      aws_secret_access_key=env["AWS_SECRET_ACCESS_KEY"])
+    s3.head_bucket(Bucket=env["S3_BUCKET"])
+    r = s3.list_objects_v2(Bucket=env["S3_BUCKET"], Prefix="warehouse/", MaxKeys=1)
+    print("BUCKET_OK")
+    print("WAREHOUSE_OK" if r.get("KeyCount", 0) > 0 else "WAREHOUSE_EMPTY")
+except Exception as e:
+    print("S3_FAIL", type(e).__name__)
+PY
+)
+printf '%s\n' "$s3check" | grep -q "BUCKET_OK" && ok "S3 bucket truy cập được (IAM hợp lệ)" || no "không truy cập được S3 bucket"
+printf '%s\n' "$s3check" | grep -q "WAREHOUSE_OK" && ok "prefix warehouse/ có dữ liệu Iceberg" || no "warehouse/ rỗng (chưa ghi được lên S3)"
 
 # --- 3. Iceberg REST catalog ------------------------------------------------
 cfg=$(curl -s "$CATALOG_URL/v1/config" 2>/dev/null)

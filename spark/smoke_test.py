@@ -31,7 +31,7 @@ def main() -> int:
     spark.sql(f"DROP TABLE IF EXISTS {TEST_TABLE}")
     spark.sql(f"CREATE TABLE {TEST_TABLE} (id BIGINT, note STRING) USING iceberg")
     spark.sql(f"INSERT INTO {TEST_TABLE} VALUES (1, 'hello'), (2, 'lakehouse')")
-    print("[3] table created and rows written to MinIO")
+    print("[3] table created and rows written to S3")
 
     rows = spark.sql(f"SELECT * FROM {TEST_TABLE} ORDER BY id").collect()
     print(f"[4] read back: {[(r['id'], r['note']) for r in rows]}")
@@ -46,7 +46,7 @@ def main() -> int:
 
     spark.sql(f"DROP TABLE {TEST_TABLE} PURGE")
     print("[6] test table dropped\n")
-    print("SMOKE TEST PASSED - jars, REST catalog, and MinIO write path all work")
+    print("SMOKE TEST PASSED - jars, REST catalog, and S3 write path all work")
 
     spark.stop()
     return 0

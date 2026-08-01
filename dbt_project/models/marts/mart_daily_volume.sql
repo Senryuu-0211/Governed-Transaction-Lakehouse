@@ -19,4 +19,7 @@ select
     current_timestamp()                                     as _refreshed_at
 from {{ ref('fact_transactions') }} f
 join {{ ref('dim_date') }} d using (date_key)
+-- Fact GIỮ dòng soft-delete (giao dịch đã purge ở nguồn) để không xoá dấu vết
+-- kiểm toán -> mọi mart phục vụ báo cáo PHẢI lọc ra.
+where not f.is_deleted
 group by 1, 2, 3, 4, 5, 6

@@ -25,7 +25,18 @@ concat(substring({{ expr }}, 1, 3), '*****', substring({{ expr }}, -2, 2))
 concat(substring({{ expr }}, 1, 2), '***@', substring_index({{ expr }}, '@', -1))
 {%- endmacro %}
 
-{# Debezium serialize DATE = số ngày kể từ epoch -> đổi ra năm sinh #}
-{% macro generalize_birth_year(days_expr) -%}
-year(date_add(to_date('1970-01-01'), cast({{ days_expr }} as int)))
+{#
+  Hạ độ phân giải ngày sinh -> chỉ còn NĂM.
+
+  ⚠️ HỒI QUY ĐÃ SỬA (31-07): bản cũ giả định Debezium mã hoá DATE = SỐ NGÀY kể từ
+  epoch (đúng với JSON converter thời Phase 1-2):
+      year(date_add(to_date('1970-01-01'), cast(expr as int)))
+  Sang Phase 2.5 dùng AVRO, giá trị về dưới dạng CHUỖI ISO "1957-06-16" ->
+  cast('1957-06-16' as int) = NULL -> birth_year NULL cho TOÀN BỘ 100 tài khoản.
+  Không test nào kiểm cột này nên lỗi im lặng nhiều ngày.
+  Bài học: đổi format serialize là phải soi lại MỌI chỗ parse kiểu dữ liệu, và mỗi
+  trường PII phải có test riêng (giờ có not_null trên birth_year chặn tái diễn).
+#}
+{% macro generalize_birth_year(date_expr) -%}
+year(to_date({{ date_expr }}))
 {%- endmacro %}
