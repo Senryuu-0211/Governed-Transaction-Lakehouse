@@ -4,6 +4,205 @@ Nhật ký để resume nhanh sau khi context bị nén. Mới nhất ở trên.
 
 ---
 
+## 01-08-2026 — Tối ưu chi phí S3 + sửa 3 lỗi lộ ra khi chạy thật
+
+Ngày này KHÔNG thêm tính năng mới — toàn bộ là **hệ quả của việc chuyển sang S3 thật**:
+chi phí biến mọi lãng phí thành tiền, và tiền làm lộ những lỗi mà MinIO che kín.
+
+### 💸 Ước tính chi phí phát hiện một quả bom: ~$3.000/tháng
+Mr. Senryuu hỏi "chạy liên tục 1 tháng tốn bao nhiêu". Tính ra:
+storage ~$1.3 · PUT ~$4 · **data-transfer-out ~$3.000**.
+**Gốc:** compute chạy **on-prem**, storage ở **cloud** → mỗi byte Spark đọc từ S3 là
+egress TÍNH TIỀN. Hai thủ phạm:
+1. `audit_reconciliation` **quét TOÀN BỘ Bronze mỗi giờ** (thiết kế của tôi hôm 31-07)
+   → Bronze cuối tháng ~100GB × 720 lần ≈ **36TB egress**.
+2. `fact_transactions` là `materialized='table'` → **rebuild trọn từ Silver mỗi giờ** ≈ 7TB.
+
+**Bài học nền (data gravity):** *compute on-prem + storage cloud = trả tiền cho MỌI lần đọc.*
+Nếu Spark chạy trên EC2 cùng region thì egress = $0. Đây là lý do THẬT khiến người ta đưa
+compute về cùng vùng với storage, không phải vì "cloud cho tiện".
+
+### Sửa 1 — reconciliation theo CỬA SỔ, chạy 1 lần/sáng
+- Lọc `ingest_ts >= current_date - N` → **prune partition** (Bronze partition `days(ingest_ts)`),
+  đọc ~5GB thay vì toàn kho. Thêm cột `window_days` vào sổ để tự mô tả.
+- Chuyển khỏi `gtl_transform` @hourly → task `reconcile` trong `gtl_maintenance` @daily
+  (00:00 UTC = **07:00 sáng VN**, đúng ý Mr. Senryuu: biết lệch ngay đầu ngày).
+- **Ngữ nghĩa đổi có chủ đích:** từ *"toàn lịch sử khớp"* → *"mọi thứ nạp gần đây khớp"*.
+  Đúng chuẩn kiểm toán hơn — mỗi ngày chứng minh tại thời điểm đó rồi ghi vĩnh viễn vào sổ;
+  không ai đi chứng minh lại năm 2019 mỗi sáng.
+- `maintenance` dùng `TriggerRule.ALL_DONE`: nén vẫn chạy dù đối soát fail (nén là việc chống
+  phình kho — khác `push_marts` nơi CHẶN mới đúng).
+
+### Sửa 2 — `fact_transactions`: `table` → `incremental MERGE`
+Mr. Senryuu chốt đúng: **dim full snapshot thì bình thường, fact full snapshot là chết.**
+Kimball có 3 loại fact; chỉ *periodic snapshot* mới là snapshot theo kỳ. Của mình là
+**transaction fact** → phải incremental. MERGE (không append) vì `status` đổi theo vòng đời.
+- ⚠️ **Bẫy soft-delete:** bản `table` lọc `where not is_deleted` nên dòng bị purge tự biến mất
+  khi rebuild. Với incremental thì KHÔNG — lô mới không chứa nó, MERGE không đụng, dòng ở lại
+  vĩnh viễn → sai số. Fix: **fact GIỮ dòng soft-delete kèm cờ `is_deleted`**, 3 mart + 1 test
+  lọc ra. Đúng tinh thần lakehouse có kiểm toán: *không xoá dấu vết, chỉ đánh dấu*.
+- Thêm `_kafka_offset` vào fact: vừa là watermark incremental, vừa là dấu vết lineage.
+
+**Ước tính sau sửa: ~$6-10/tháng** (từ ~$3.000).
+
+### 🐛 Lỗi 1 — Derby metastore lock: hai DAG sẽ đụng nhau mỗi sáng
+```
+ERROR XSDB6: Another instance of Derby may have already booted the database
+```
+dbt-spark session mode boot một Hive metastore **Derby nhúng**, Derby chỉ cho **MỘT** tiến
+trình mở database. Mà tôi vừa tạo ra tình huống: `gtl_transform` (@hourly) và `gtl_maintenance`
+(@daily, có task reconcile) **cùng nổ lúc 00:00 UTC** → một cái chết mỗi sáng.
+**Fix:** `scripts/dbt.sh` tạo `mktemp -d` riêng mỗi lần chạy, chứa **conf đã render + Derby
+metastore riêng** (`-Dderby.system.home`), tự dọn khi thoát. An toàn vì Derby gần như không
+dùng — catalog thật là Iceberg REST. Tiện thể fix một race khác: hai lần chạy cùng render đè
+lên `spark-defaults.conf` chung.
+**Chứng minh:** chạy 2 dbt song song (của tôi + của DAG) → `Done. PASS=31 ERROR=0`, không XSDB6.
+
+### 🐛 Lỗi 2 — chạy được ≠ nên chạy: vỡ core budget
+Sau khi fix Derby, hai dbt chạy được cùng lúc — nhưng mỗi cái lấy `local[6]`, cộng stream
+`local[3]` = **15/16 luồng** → JVM giành nhau, cả hai cùng bò (đo: 66%/11%/8.9% CPU).
+**Fix:** **Airflow pool `gtl_dbt` 1 slot**, gán cho `dbt_run`/`dbt_test`/`reconcile`.
+`cdc_health` (đọc file), `push_marts` (local[2]), `maintenance` (local[4]) để `default_pool`.
+→ Derby fix lo **tính đúng đắn**; pool lo **trật tự tài nguyên**. Cần cả hai.
+
+### 🔴 Lỗi 3 — metadata.json chiếm 82% dung lượng (thủ phạm ẩn lớn nhất)
+Đo phân loại file trên `bronze.transactions`:
+```
+metadata.json   1.217 MB  81.8%  (1.601 file)
+DATA (parquet)    190 MB  12.8%
+manifest-list      61 MB   4.1%
+manifest           21 MB   1.4%
+```
+**Cơ chế:** Iceberg ghi **một `metadata.json` mỗi commit**, mỗi file chứa **toàn bộ lịch sử
+snapshot** → file sau to hơn file trước. Trigger 30s = 2.880 commit/ngày. Mặc định **giữ tất
+cả vĩnh viễn**. Tệ hơn: mỗi lần **mở bảng** đều đọc file mới nhất (760KB, phình dần) → trên S3
+là **egress cho MỌI truy vấn**.
+⚠️ **`expire_snapshots` KHÔNG dọn loại này** — tôi đã tưởng nó dọn rồi.
+**Fix:** hai table property, áp ở **3 chỗ** để không sót — DDL Bronze (bảng mới),
+`dbt_project.yml` (Silver/Gold/marts), `maintenance.py` (vá mọi bảng đang tồn tại, mỗi ngày):
+```
+write.metadata.delete-after-commit.enabled = true
+write.metadata.previous-versions-max       = 10
+```
+**Chưa hội tụ:** sau 1 lần maintenance mới giảm 1.217→1.103 MB. Nghi file cũ nằm ngoài
+metadata-log nên không được theo dõi → **cần xác minh lại**.
+
+### 🔴 Lỗi 4 (CHƯA SỬA) — `remove_orphan_files` không chạy được trên S3
+```
+UnsupportedFileSystemException: No FileSystem for scheme "s3"
+```
+Thủ tục này phải tìm **file Iceberg KHÔNG biết** → không tra được metadata, buộc phải **LIST
+storage**, và phần listing đó dùng **Hadoop FileSystem API** — trong khi project cố ý **không
+dùng `hadoop-aws`** (chỉ `S3FileIO`, để tránh xung đột version Hadoop/AWS SDK).
+→ **Cơ chế dọn file mồ côi thêm hôm 30-07 CHƯA TỪNG hoạt động.** Lớp phòng thủ chính cho sự cố
+397GB đang rỗng. Lỗi của tôi: thêm rồi báo "đã fix" mà không chạy thật để kiểm.
+
+**Đã điều tra xong, có đường sạch (chưa triển khai):**
+| Kiểm tra | Kết quả |
+|---|---|
+| `S3FileIO` liệt kê được? | ✅ có `listPrefix`/`deletePrefix` |
+| Iceberg 1.9.2 tự dùng cho orphan? | ❌ 0 class trong `spark/actions` tham chiếu `SupportsPrefixOperations` |
+| Cửa thoát chính thức? | ✅ tham số **`file_list_view`** |
+| Schema cần | `file_path` (string) · `last_modified` (timestamp) |
+
+**Phương án chốt (c):** boto3 liệt kê S3 → DataFrame → temp view → truyền `file_list_view` cho
+`remove_orphan_files`. Ta chỉ cung cấp **phần mang tính storage-cụ-thể** (danh sách object),
+còn **phần nguy hiểm — quyết định cái gì là mồ côi và xoá nó — vẫn do Iceberg làm**. Không thêm
+`hadoop-aws`, không tự viết code có quyền xoá.
+
+### Kiến trúc: S3 vs HDFS — chốt lại vì Mr. Senryuu lo stack sai
+| | HDFS | S3 |
+|---|---|---|
+| Thư mục | thật | ảo (chỉ là tiền tố key) |
+| Đổi tên | **nguyên tử, rẻ** | **không có** (copy+delete) |
+| LIST | rẻ | đắt, tính tiền |
+Bảng **Hive** đời cũ dựa vào đúng hai thứ S3 không có (LIST thư mục + rename nguyên tử) →
+trên S3 vừa chậm vừa sai. **Iceberg sinh ra chính vì điều đó** (Netflix, bảng Hive trên S3 hỏng):
+không LIST (file ghi tường minh trong manifest), không rename (commit = **hoán đổi con trỏ
+nguyên tử trong CATALOG** — chính là `iceberg-rest` + Postgres của mình).
+→ **S3 là mục tiêu thiết kế số một của Iceberg, không phải trường hợp phụ.** Stack không sai.
+Bằng chứng: đổi MinIO→S3 chỉ sửa endpoint, `dbt build` 82 PASS, không sửa dòng model nào.
+Lỗi 4 chỉ là **rough edge của một thủ tục bảo trì**, và chính việc Iceberg chừa sẵn
+`file_list_view` chứng tỏ nó được thiết kế cho môi trường không có Hadoop FS.
+
+### Thêm: 2 mức nghiêm trọng cho anomaly test (học từ pipeline production của Mr. Senryuu)
+Tài liệu `campaign_master` bên anh dùng **Error vs Warning** (`volume_no_decrease` = Error,
+`volume_growth_within_10pct` = Warning). Mình đang hard-fail tất → sản lượng tụt tự nhiên ngày
+lễ cũng chặn báo cáo → vài lần là người ta **phớt lờ đèn đỏ**, cổng mất uy tín.
+**Fix:** test trả **1 dòng cho MỖI ngưỡng bị vượt**, dbt map số dòng → mức
+(`warn_if='>0'`, `error_if='>1'`), kèm cột `breach` ghi lý do bằng tiếng người:
+| Test | WARN | ERROR |
+|---|---|---|
+| Sụt sản lượng | >20% | >40% |
+| Lệch phân phối tiền | >30% | >60% |
+| NULL merchant_id | >1% | >5% |
+`assert_reconciliation` + `assert_gold_no_raw_pii` **giữ error tuyệt đối** — lệch một xu là
+lệch, lộ PII là lộ, không có vùng xám.
+Điểm xác nhận thiết kế: bên anh *"chưa có baseline → bỏ qua, không fail"* **giống hệt** guard
+7 ngày của mình — hai bên độc lập nghĩ ra cùng giải pháp.
+
+### Bài học chung của ngày
+**Plan không thay được việc chạy và đo.** Cả 4 lỗi hôm nay đều KHÔNG có trong plan Phase 4;
+chúng chỉ lộ khi (a) chạy thật, (b) tính ra tiền, (c) đo từng loại file. Và hai trong số đó là
+lỗi do **chính tôi tạo ra** khi sửa thứ khác.
+
+---
+
+## 31-07-2026 — Phase 4: Governance nâng cao (reconciliation · anomaly · PII · audit)
+
+### Mục tiêu đạt
+Bốn trụ governance, **toàn bộ bằng dbt/Iceberg-native — không thêm một tool nào**:
+1. **Sổ đối soát** `gold.audit_reconciliation` (append-only) — chứng minh tiền vào = tiền ra.
+2. **3 anomaly test** dbt-native — bắt loại lỗi mà 71 test cấu trúc mù hoàn toàn.
+3. **PII** — tài liệu hoá 3 tầng access + test chặn hồi quy lộ PII ở Gold.
+4. **Audit/time-travel** — khai thác Iceberg snapshot + tài liệu hoá giới hạn của nó.
+
+### Quyết định (ghi rõ đánh đổi)
+- **BỎ Great Expectations** (plan gốc có). Đọc kỹ JD ngân hàng: nó đòi năng lực *"anomaly
+  detection"*, **không nêu tool nào**. dbt singular test làm được → thêm GE chỉ để gọi tên một
+  tool mà JD không đòi = lạm dụng stack. (Tôi từng lập luận ngược, Mr. Senryuu bắt đúng: *"tôi có
+  thấy bảo dùng GE đâu nhỉ?"* — tôi đã suy diễn sai từ JD.)
+- **Reconcile tính lại Bronze ĐỘC LẬP từ CDC thô**, không tái dùng Silver: nếu lấy số từ Silver
+  rồi so Gold thì hai vế cùng đi qua một đường transform → lỗi chung triệt tiêu nhau, hoá ra đối
+  soát với chính mình.
+- **Audit hướng A**: khai thác Iceberg snapshot (có sẵn) + CHỈ thêm sổ đối soát. Không xây bảng
+  `pipeline_runs` tuỳ biến — Airflow + Iceberg đã ghi run/commit rồi, xây nữa là hai nguồn sự thật.
+
+### 🔑 BÀI HỌC LỚN NHẤT: reconciliation trên pipeline streaming phải AS-OF một mốc
+Bản đầu tiên so `count(Bronze)` với `count(Gold)` → **lệch 31.253 giao dịch / 129 triệu tiền**.
+Không phải mất tiền: Bronze được stream nạp LIÊN TỤC, còn Gold chỉ đóng băng tại lần dbt chạy gần
+nhất → so **mục tiêu di động với ảnh chụp**, lệch to dần theo thời gian.
+**Fix:** lấy `max(_kafka_offset)` của Silver làm **watermark**, chỉ tính phần Bronze nằm trong mốc
+(lọc offset TRƯỚC rồi mới dedup — phải lấy trạng thái cuối *mà Silver đã thấy*). Ghi luôn
+`watermark_offset` vào sổ để kiểm toán tái kiểm được.
+→ Kết quả: **130.480 = 130.480, lệch 0đ trên $542.883.061,63**.
+
+### 🐛 BẮT ĐƯỢC LỖI THẬT (đúng mục đích tồn tại của Phase 4)
+`birth_year` NULL cho **toàn bộ 100 tài khoản** → `age`, `age_band` chết theo, mọi phân tích theo
+độ tuổi im lặng vô dụng. Truy ra: **hồi quy từ Phase 2.5**. Macro `generalize_birth_year` viết
+thời JSON converter (Debezium mã hoá DATE = số ngày từ epoch), nhưng Avro trả **chuỗi ISO**
+`"1957-06-16"` → `cast(... as int)` = NULL → `year(NULL)` = NULL.
+**Fix:** `year(to_date(expr))` + **thêm `not_null` test trên birth_year cả Silver lẫn Gold**.
+Fix macro chỉ chữa triệu chứng; cái chữa GỐC là test — lỗi sống được nhiều ngày chỉ vì không ai kiểm.
+**Bài học:** đổi format serialize phải soi lại MỌI chỗ parse kiểu dữ liệu.
+
+### Chứng minh anomaly test hoạt động (không chỉ "PASS")
+Data hiện chỉ có **1 ngày lịch sử** → 2 test dựa-trên-lịch-sử pass **vì guard**, không phải vì đã
+kiểm chứng logic. Nên mô phỏng bằng data giả để chứng minh cả hai hành vi:
+- 7 ngày nền × 1000/ngày, hôm nay 400 (sụt 60%) → **BẮT ĐƯỢC** ✅
+- 2 ngày nền, cùng mức sụt → **im lặng** (guard chặn báo động giả) ✅
+Guard tồn tại vì một test kêu oan ngay ngày đầu sẽ dạy người ta phớt lờ cổng — phá đúng mục đích cổng.
+
+### Cấu hình mấu chốt (nhớ để không vấp lại)
+- `audit_reconciliation`: `full_refresh=false` → model **phớt lờ `--full-refresh`**, bảo vệ sổ
+  kiểm toán bằng CODE chứ không bằng lời dặn. Thêm cột phải có `on_schema_change='append_new_columns'`.
+- Đổi schema bảng incremental đã tồn tại → phải DROP tay (đúng tinh thần: reset sổ kiểm toán là
+  hành động CÓ CHỦ ĐÍCH).
+- Time-travel chỉ lùi được ~10 snapshot (`expire_snapshots retain_last=10`) → bằng chứng dài hạn
+  PHẢI nằm ở sổ append-only, không dựa time-travel.
+
+---
+
 ## 26-07-2026 — Phase 3: Airflow orchestration (`verify_3.sh` 6/6 + end-to-end xanh)
 
 ### Mục tiêu đạt
