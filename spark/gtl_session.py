@@ -113,19 +113,55 @@ def get_spark(
         # Bonus: cùng cơ chế này chạy được với IAM role khi lên EC2/EKS sau này —
         # không phải sửa code, đúng tinh thần "đổi endpoint là lên cloud".
         .config(f"spark.sql.catalog.{CATALOG}.client.region", region)
-        # --- Timeout: BẮT BUỘC cho job dài chạm S3 ---------------------------
-        # SỰ CỐ 01-08: maintenance treo 1h47 ở 0% CPU. Không phải chậm — một kết
-        # nối TCP tới S3 chết nửa chừng (Send-Q còn 1.053 byte chưa ai ACK), mà
-        # mặc định KHÔNG có socket timeout nên SDK chờ vô hạn. Job không lỗi,
-        # không chết, chỉ đứng im — kiểu hỏng khó phát hiện nhất.
-        # 60s: đủ rộng cho một request S3 chậm bình thường, đủ hẹp để một socket
-        # chết bị cắt và SDK retry thay vì treo cả job hàng giờ.
+        # --- Kết nối HTTP tới S3: BẮT BUỘC cho job dài -----------------------
+        # SỰ CỐ 01-08: `maintenance.py` treo ở 0% CPU, nhiều lần, mỗi lần hàng giờ.
+        # Không phải chậm — nó ĐANG CHỜ. `ss -tnp` chỉ đúng thủ phạm:
+        #     ESTAB  Send-Q=1005  192.168.1.48 -> 52.217.80.92:443   (S3)
+        #            ^ đã gửi 1005 byte mà KHÔNG AI ACK
+        #
+        # ⚠️ HAI NHÓM CẤU HÌNH DƯỚI ĐÂY GIẢI HAI VẤN ĐỀ KHÁC NHAU — tôi đã nhầm
+        # một lần: thêm mỗi timeout rồi tưởng xong, nhưng job vẫn treo y hệt.
+        #
+        # (1) TIMEOUT — cắt khi ĐANG CHỜ TRẢ LỜI.
+        #     Cần, nhưng KHÔNG đủ: nó không ngăn client rút ra một kết nối ĐÃ CHẾT
+        #     từ connection pool ngay từ đầu.
         .config(f"spark.sql.catalog.{CATALOG}.http-client.type", "apache")
         .config(f"spark.sql.catalog.{CATALOG}.http-client.apache.socket-timeout-ms", "60000")
         .config(f"spark.sql.catalog.{CATALOG}.http-client.apache.connection-timeout-ms", "10000")
         .config(
             f"spark.sql.catalog.{CATALOG}.http-client.apache.connection-acquisition-timeout-ms",
             "30000",
+        )
+        # (2) TUỔI THỌ KẾT NỐI — mới là thứ sửa đúng gốc.
+        #     Máy này ra Internet qua NAT của router gia đình, và NAT nào cũng có
+        #     hạn nhàn rỗi: quá hạn thì nó lặng lẽ vứt bản ghi ánh xạ. Hai đầu vẫn
+        #     tưởng kết nối còn sống. Lần dùng lại tiếp theo, gói tin bay vào hư
+        #     không -> Send-Q kẹt, không bao giờ có ACK, không bao giờ có trả lời.
+        #     Job Iceberg đặc biệt dễ dính vì nó thưa thớt: nén một nhóm file mất
+        #     nhiều phút không đụng tới S3, thừa thời gian cho NAT quên.
+        #     30s idle < mọi hạn NAT thông dụng (thường 60-300s) -> ta chủ động
+        #     đóng TRƯỚC khi nó bị vứt, thay vì phát hiện sau khi đã chết.
+        .config(
+            f"spark.sql.catalog.{CATALOG}.http-client.apache.connection-max-idle-time-ms",
+            "30000",
+        )
+        # Trần cứng cho MỌI kết nối, kể cả đang bận: chặn kiểu hỏng nào mà idle
+        # reaper không thấy.
+        .config(
+            f"spark.sql.catalog.{CATALOG}.http-client.apache.connection-time-to-live-ms",
+            "300000",
+        )
+        # Luồng nền thực sự đi dọn kết nối quá hạn — không có nó thì hai mốc trên
+        # chỉ được kiểm lúc tình cờ lấy kết nối ra dùng.
+        .config(
+            f"spark.sql.catalog.{CATALOG}.http-client.apache.use-idle-connection-reaper-enabled",
+            "true",
+        )
+        # Keepalive TCP: gửi gói thăm dò định kỳ để NAT thấy kết nối vẫn "sống" và
+        # không vứt ánh xạ. Bảo hiểm lớp hai cho cùng một vấn đề.
+        .config(
+            f"spark.sql.catalog.{CATALOG}.http-client.apache.tcp-keep-alive-enabled",
+            "true",
         )
         .config("spark.sql.defaultCatalog", CATALOG)
     )
