@@ -1,0 +1,5 @@
+# Copy sang `localstack.auto.tfvars` (đã gitignore) rồi chỉnh nếu cần.
+# Đây là cấu hình MẶC ĐỊNH AN TOÀN: mọi thứ trỏ vào LocalStack, không chạm AWS thật.
+use_localstack = true
+bucket_name    = "gtl-lakehouse-local"
+environment    = "local"

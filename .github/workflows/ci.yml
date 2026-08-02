@@ -117,6 +117,25 @@ jobs:
       - name: docker compose config
         run: docker compose --env-file .env.example config --quiet
 
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      # `fmt -check` và `validate` KHÔNG cần AWS lẫn LocalStack — chúng chỉ đọc
+      # cú pháp, kiểu dữ liệu, và quan hệ giữa các resource. Đúng loại kiểm tra
+      # thuộc về CI.
+      # CỐ Ý KHÔNG chạy `apply` ở đây: dựng LocalStack trong runner rồi apply chỉ
+      # chứng minh code chạy được trên LocalStack — mà LocalStack không phải AWS
+      # (xem terraform/README.md, hai giới hạn đã đo được). Một cổng xanh dựa trên
+      # môi trường giả thì tệ hơn không có.
+      - name: terraform fmt
+        run: terraform -chdir=terraform fmt -check -recursive
+
+      - name: terraform validate
+        run: |
+          terraform -chdir=terraform init -backend=false -input=false
+          terraform -chdir=terraform validate
+
       - name: shellcheck
         # Script bash ở đây làm việc thật (tắt pipeline, xoá, deploy). Bài học
         # verify_3.sh: `set -o pipefail` + `grep -q` cho exit 141 -> báo FAIL oan.

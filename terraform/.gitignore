@@ -1,0 +1,9 @@
+# State CHỨA giá trị nhạy cảm ở dạng CHỮ THÔ (kể cả khi tài nguyên không lộ gì,
+# Terraform vẫn ghi lại mọi thuộc tính đã đọc). Không bao giờ commit.
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+# tfvars chứa tên bucket thật -> giữ ngoài repo công khai, y như .env
+*.auto.tfvars
+terraform.tfvars
