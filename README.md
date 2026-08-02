@@ -1,5 +1,13 @@
 # Governed Transaction Lakehouse
 
+[![CI](https://github.com/Senryuu-0211/Governed-Transaction-Lakehouse/actions/workflows/ci.yml/badge.svg)](https://github.com/Senryuu-0211/Governed-Transaction-Lakehouse/actions/workflows/ci.yml)
+![Spark](https://img.shields.io/badge/Spark-3.5.0-E25A1C?logo=apachespark&logoColor=white)
+![Iceberg](https://img.shields.io/badge/Iceberg-1.9.2-2496ED)
+![Kafka](https://img.shields.io/badge/Kafka-KRaft-231F20?logo=apachekafka&logoColor=white)
+![dbt](https://img.shields.io/badge/dbt-1.12-FF694B?logo=dbt&logoColor=white)
+![Airflow](https://img.shields.io/badge/Airflow-2.8-017CEE?logo=apacheairflow&logoColor=white)
+![AWS S3](https://img.shields.io/badge/AWS_S3-real-569A31?logo=amazons3&logoColor=white)
+
 A near-real-time banking transaction pipeline and **governed lakehouse**, built
 correctness-first and governance-first. It captures every transaction change via
 **Change Data Capture (CDC)** with no lost events, lands it in an **ACID lakehouse**
@@ -10,31 +18,102 @@ with audit and time-travel, and enforces data quality, lineage, and PII controls
 > rate on a single host. Where a choice is "designed to scale to X" vs "demo runs at Y", the
 > code says so.
 
+**What this repo is really about:** not that these tools were wired together, but *why each
+one is there and what breaks without it*. Every threshold, retention window, and guard rail
+below traces to a specific failure — several of which happened here, on this hardware, and are
+written up in [`issues/`](issues/) rather than quietly fixed.
+
 ---
 
-## Architecture (compute local, storage on AWS S3)
+## Architecture
 
-```
-Postgres (CDC source)
-   │  logical replication (WAL)
-   ▼
-Debezium ──► Kafka (KRaft) ──► Spark Structured Streaming
-                                   │  Debezium envelope (op/before/after)
-                                   ▼
-                        Bronze  ──►  Silver  ──►  Gold      (Apache Iceberg on AWS S3)
-                        (raw CDC)   (clean+PII)  (star schema)
-                                   │
-                        governance (dbt tests · lineage · reconciliation · PII masking)
-                                   │
-                        Airflow (orchestration)  ·  Prometheus/Grafana/Loki (observability)
+Compute runs on-premise; storage is **real AWS S3**.
+
+```mermaid
+flowchart TB
+    subgraph CAP["① Capture — no event left behind"]
+        direction LR
+        PG[("PostgreSQL 16<br/><i>wal_level=logical</i>")]
+        DBZ["Debezium<br/><i>reads the WAL</i>"]
+        SR{{"Apicurio<br/>Schema Registry"}}
+        KFK[["Kafka KRaft<br/><i>30-day retention</i>"]]
+        PG -->|"logical replication"| DBZ
+        DBZ -->|Avro| KFK
+        SR -.->|"breaking schema<br/><b>409 · REJECTED</b>"| KFK
+    end
+
+    subgraph LAKE["② Lakehouse — Apache Iceberg on AWS S3"]
+        direction LR
+        BRZ["<b>Bronze</b><br/>raw CDC<br/><i>append-only</i>"]
+        SLV["<b>Silver</b><br/>current state<br/><i>typed · PII masked</i>"]
+        GLD["<b>Gold</b><br/>Kimball star<br/><i>incremental MERGE</i>"]
+        MRT["<b>Marts</b><br/>aggregates"]
+        BRZ -->|dbt| SLV -->|dbt| GLD -->|dbt| MRT
+    end
+
+    subgraph SERVE["③ Serving"]
+        direction LR
+        PGM[("Postgres<br/>serving copy")]
+        SUP["Superset<br/><i>business users</i>"]
+        PGM --> SUP
+    end
+
+    subgraph CTRL["Control plane"]
+        direction LR
+        AF{{"<b>Airflow</b><br/><i>SSHOperator to host</i>"}}
+        OBS{{"<b>Prometheus + Grafana</b><br/><i>9 alert rules</i>"}}
+    end
+
+    KFK ==>|"Spark Structured Streaming<br/>30s trigger"| BRZ
+    MRT ==> PGM
+    CTRL -.->|"orchestrates · watches slot lag,<br/>freshness, retention, S3 growth"| LAKE
+
+    style BRZ fill:#b06a2c,color:#fff,stroke:#8a5122
+    style SLV fill:#6b7480,color:#fff,stroke:#525963
+    style GLD fill:#c9971a,color:#fff,stroke:#a17915
+    style MRT fill:#41627e,color:#fff,stroke:#2f4759
 ```
 
-**Cloud-ready by design — and proven:** storage runs on **real AWS S3**. The claim below was
-tested by actually doing it: the pipeline started on MinIO and moved to S3 by changing an endpoint
-and credentials — `dbt build` came back **82 PASS / 0 ERROR** with **no model or job code changed**.
-Because all storage access goes through the **S3 API**, moving to the cloud (AWS S3 + Glue +
-Athena) is an endpoint change with **no code rewrite** — one codebase serves both on-premise and
-cloud, with no vendor lock-in.
+**Cloud-ready by design — and proven, not asserted.** The pipeline started on MinIO and moved to
+real AWS S3 by changing an endpoint and credentials: `dbt build` came back **82 PASS / 0 ERROR**
+with **no model or job code changed**. Because all storage access goes through the **S3 API**,
+moving further into the cloud (Glue + Athena) is an endpoint change, not a rewrite — one codebase
+serves both on-premise and cloud, with no vendor lock-in.
+
+> **The honest counterweight:** compute on-premise + storage in the cloud means every byte Spark
+> reads from S3 is billed egress, and the round trip to `us-east-1` measures **249 ms** from here.
+> Data gravity is not a slogan — it is 249 ms multiplied by the number of requests, which is why
+> [cost control](#storage-cost-control-learned-the-hard-way) is a first-class concern below.
+
+---
+
+## Where correctness is enforced
+
+Quality is a **gate**, not a report. Each arrow below is a place the pipeline refuses to continue.
+
+```mermaid
+flowchart TD
+    A["Source schema changes"] -->|"Schema Registry<br/><b>409 · rejected</b>"| B["Kafka"]
+    B --> C["Bronze"]
+    C -->|"79 dbt tests<br/><i>49 not_null · 9 unique · 9 accepted_values<br/>6 relationships · 6 singular</i>"| D["Silver / Gold"]
+    D -->|"reconciliation<br/><i>as of a watermark</i>"| E["Marts"]
+    E -->|"dbt_test gates push_marts"| F["Superset<br/>business users"]
+
+    G["Anomaly detection<br/><i>vs each table's own history</i>"] -.->|"warn / error<br/>two tiers"| D
+    H["PII masking<br/><i>hash · partial · generalise</i>"] -.-> D
+    I["Iceberg snapshots"] -.->|"time travel<br/>= audit"| D
+```
+
+Currently **12 dbt models** guarded by **79 tests**. Concretely, on the last full run:
+**683,527 transactions**, **$2,844,556,184.33** reconciled between Bronze and Gold with a
+difference of **exactly 0**.
+
+The reconciliation is worth one more sentence, because the naive version of it was wrong in an
+instructive way. Comparing a *live* Bronze against a *frozen* Gold reported a **$129 M** gap on
+its first run — every cent of which was an artifact of Bronze continuing to ingest while Gold
+stood still. The fix was to reconcile **as of a watermark** (Silver's `max(_kafka_offset)`),
+filtering offsets *before* deduplication. A reconciliation that cries wolf is worse than none,
+because the second time it fires nobody looks.
 
 ---
 
@@ -49,9 +128,10 @@ cloud, with no vendor lock-in.
 | Transform modelling | **dbt** (dbt-spark) | Structure, tests, docs, lineage over Spark execution |
 | Lake storage | **AWS S3** (was MinIO) | Storage is reached only through the S3 API, so the move off MinIO was an endpoint swap, not a rewrite |
 | Table format | **Apache Iceberg** | ACID, time-travel (audit), schema evolution, engine-agnostic |
-| Catalog | **Iceberg REST** → Glue (Part 2) | |
-| Orchestration | **Airflow** (LocalExecutor) | |
-| Observability | **Prometheus + Grafana + Loki** | |
+| Schema contract | **Apicurio + Avro** | An incompatible source schema is rejected **at the Kafka gate** (409) instead of silently nulling columns downstream |
+| Catalog | **Iceberg REST** → Glue (Part 2) | Lightweight locally; Glue is the AWS-native target |
+| Orchestration | **Airflow** (LocalExecutor) | Airflow *orchestrates*, the host *computes* — jobs run via `SSHOperator` in a real venv, not inside the scheduler |
+| Observability | **Prometheus + Grafana** | Reuses the `node_exporter` already running 24/7 via its textfile collector — no extra daemon to die silently. **Loki was deliberately cut**: one host, `docker logs` is enough, and an unused log store is cost without insight |
 
 **Correctness rules baked in:** money is `DECIMAL`, never float; `FAILED` transactions are not
 real money; `REVERSED` transactions are never double-counted; Bronze total reconciles to Gold
@@ -87,9 +167,9 @@ average *is* the small-files problem), and estimated monthly cost.
 | **1 — CDC pipeline** | CDC flows end-to-end → Bronze Iceberg captures INSERT/UPDATE/DELETE |
 | 2 — Medallion transform | Gold star schema + dbt structural tests (quality as a gate), correct REVERSAL |
 | 3 — Orchestration | Airflow-driven, idempotent, backfillable |
-| 4 — Advanced governance | Time-travel audit, lineage, reconciliation, Great Expectations, PII masking |
+| 4 — Advanced governance | Time-travel audit, lineage, reconciliation, anomaly detection, PII masking |
 | 5 — Observability | Lag/freshness dashboards + alerting, gated by a maintenance-window flag |
-| 6 — CI/CD + LocalStack | Automated deploy; cloud code runs $0 on LocalStack |
+| 6 — CI/CD + IaC | CI gates every push; Terraform validated on LocalStack ($0) |
 | Part 2 — Real AWS | S3 + Glue + Athena (endpoint swap) |
 
 ---
@@ -123,6 +203,59 @@ average *is* the small-files problem), and estimated monthly cost.
   `pipeline.sh` acts as a maintenance window, so deliberately shutting the pipeline down to save
   S3 cost stays silent while an unplanned death still pages. `verify_5.sh` 16/16 —
   see **[docs/observability.md](docs/observability.md)**
+- ✅ **Phase 6a** — CI: four jobs gate every push (ruff + 14 unit tests · `dbt parse` · gitleaks ·
+  `docker compose config` + shellcheck). The governing rule is that **CI only runs what does not
+  need real infrastructure** — recreating Postgres, Kafka, Spark and S3 inside a runner would be
+  both slow and *fake*, and a quality gate built on a fake environment is worse than none because
+  it goes green and you relax. So: **CI catches static faults, `verify_*.sh` catches real ones.**
+  On its first run CI found three genuine defects, including a `.env.example` that still described
+  MinIO — dropped weeks earlier — which meant *nobody could clone this repo and start it*
+
+---
+
+## Seeing it run
+
+<!-- Ảnh chụp: xem docs/screenshots/README.md để biết cần chụp gì và chụp thế nào. -->
+
+| | |
+|---|---|
+| ![Pipeline health dashboard](docs/screenshots/grafana-pipeline-health.png) | **`GTL · Pipeline Health`** — replication-slot lag (the metric that protects the *source* database, not the pipeline), Bronze freshness, position within the Kafka retention window, and S3 growth |
+| ![Superset marts](docs/screenshots/superset-marts.png) | **Superset over the serving marts** — the point of the whole system: a non-technical user answering their own question, without reading any code |
+| ![Airflow DAG](docs/screenshots/airflow-dag.png) | **`gtl_transform`** — `dbt_test` *gates* `push_marts`, so data that fails its tests never reaches the dashboard |
+
+Verification is scripted rather than described, so the claims above are checkable:
+
+```console
+$ bash scripts/verify_5.sh
+== VERIFY PHASE 5 — OBSERVABILITY ==
+
+[1/5] Nguồn: exporter ghi được file .prom
+  ✅ exporter chạy không lỗi
+  ✅ gtl_exporter_up = 1 (mọi nguồn số liệu đều lấy được)
+  ...
+[5/5] Cổng maintenance window: tắt pipeline thì alert phải IM
+  ✅ cờ hạ xuống 0 khi pipeline tắt
+  ✅ biểu thức có cổng trả VỀ RỖNG khi cờ = 0
+
+KẾT QUẢ: 16 PASS · 0 FAIL
+✅ Phase 5 thông suốt từ nguồn tới cảnh báo
+```
+
+```console
+$ bash scripts/pipeline.sh status
+container   : 8/8 đang chạy
+bronze_stream: 🟢 đang ghi (commit 12s trước)
+lag Bronze  : 37 message
+
+BUCKET gtl-lakehouse-…
+  tổng: 4.64 GB · 19,555 object
+  kích thước TB/object: 248.8 KB (quá nhỏ = small-files problem = nhiều PUT = tốn tiền)
+```
+
+Note what `pipeline.sh status` does *not* do: it never reports the stream as healthy just because
+a process exists. A dead Spark query once sat in the process table for ten hours while `pgrep`
+happily reported it running, so liveness is measured by **checkpoint age** — the only evidence
+that the stream is actually committing.
 
 ### Step 1a highlights
 - `wal_level=logical` with replication slots ready for Debezium
