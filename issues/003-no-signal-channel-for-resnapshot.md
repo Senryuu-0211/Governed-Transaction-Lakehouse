@@ -153,3 +153,68 @@ qua được chunk đầu tiên. Restart task để resume cũng không đổi.
 
 **Đừng đóng issue này cho tới khi thấy `op=r` thật sự về tới Bronze** và đối soát vẫn
 lệch 0 — vì đó mới là điều issue này hứa.
+
+
+---
+
+## Điều tra 05-08 — khoanh vùng được lỗi, VẪN CHƯA SỬA
+
+Buổi này không sửa được, nhưng thu hẹp đáng kể. Ghi lại để lần sau không mò lại từ đầu.
+
+### Ba điều MỚI biết
+
+**1. `stop-snapshot` KHÔNG dọn được state kẹt.**
+Gửi signal `{"type":"stop-snapshot",...}`, Debezium log `Requested stop of snapshot` — nhưng
+`incremental_snapshot_collections` trong offset **vẫn còn `public.merchants`**. Hệ quả nghiêm
+trọng: **mọi yêu cầu snapshot sau đó bị chặn im lặng** (thử `public.accounts` → signal được nhận
+nhưng không có cả dòng `will end at position`). Đây chính là lý do lần trước bật DEBUG mà không
+thấy log gì — snapshot mới chưa bao giờ được khởi động.
+
+**Cách dọn thật (Kafka Connect 3.6+):**
+```bash
+C=gtl-postgres-connector
+curl -X PUT  localhost:8083/connectors/$C/stop
+curl -s localhost:8083/connectors/$C/offsets | python3 -c "
+import json,sys; d=json.load(sys.stdin); o=d['offsets'][0]
+o['offset']={k:v for k,v in o['offset'].items() if not k.startswith('incremental_snapshot')}
+print(json.dumps({'offsets':[o]}))" \
+ | curl -X PATCH -H 'Content-Type: application/json' --data @- localhost:8083/connectors/$C/offsets
+curl -X PUT  localhost:8083/connectors/$C/resume
+```
+Giữ nguyên `lsn*`/`txId`/`ts_usec` → **không mất vị trí WAL**, chỉ gỡ state snapshot.
+
+**2. Cửa sổ watermark MỞ VÀ ĐÓNG BÌNH THƯỜNG — lỗi không nằm ở đó.**
+Sau 4 lần thử, bảng `debezium_signal` có **4 cặp** `snapshot-window-open` / `snapshot-window-close`,
+và cả 4 cặp đều đi qua WAL vào topic `gtl.public.debezium_signal`. Nghĩa là phần khó nhất của
+DBLog (ghi watermark + đọc lại qua replication) **hoạt động đúng**.
+
+**3. Lỗi nằm ở BƯỚC ĐỌC CHUNK — nó trả về RỖNG.**
+Bằng chứng: `incremental_snapshot_primary_key` = `aced000570` = Java-serialized `null`, **không
+bao giờ nhích**, qua cả 4 lần. Cửa sổ mở → đọc chunk → đóng cửa sổ → **phát 0 dòng** → khoá không
+tiến → lặp lại. Bảng `merchants` có 50 dòng và `debezium` có `SELECT`, nên "không có quyền" và
+"bảng rỗng" đều bị loại.
+
+### Đã loại trừ
+
+- ❌ Payload signal sai — message trong topic đúng nguyên văn (`cat -A` xác nhận key `gtl` + JSON)
+- ❌ Thiếu `signal.data.collection` — đã cấu hình, watermark ghi được
+- ❌ Thiếu quyền — `debezium` có `SELECT` trên `merchants`, `INSERT/UPDATE/DELETE` trên signal table
+- ❌ Bảng quá nhỏ (ca biên 50 dòng) — thử `accounts` (100 dòng) cũng không chạy
+- ❌ State kẹt là nguyên nhân gốc — dọn sạch rồi vẫn treo y hệt ở chunk đầu
+
+### Giả thuyết còn lại, theo thứ tự nên thử
+
+1. **DEBUG phải bật TỪ LÚC WORKER KHỞI ĐỘNG.** Bật qua `/admin/loggers` lúc đang chạy thì
+   `AbstractIncrementalSnapshotChangeEventSource` vẫn không in dòng DEBUG nào (chỉ 1 dòng DEBUG
+   trong cả log). Cần đặt log level trong `docker-compose.yml` (biến `CONNECT_LOG4J_LOGGERS`)
+   rồi restart — chỉ khi thấy được câu SQL của chunk mới biết nó truy vấn cái gì.
+2. **Bắt câu SQL ở phía Postgres**: bật `log_statement='all'` tạm thời rồi lọc query có
+   `ORDER BY merchant_id LIMIT` — xem nó có chạy không và trả về gì.
+3. **Tương tác với Avro/Apicurio**: dòng `op='r'` có thể chết im ở khâu serialize. Thử tạm đổi
+   `value.converter` sang JSON cho một lần chạy để loại trừ.
+4. **Phiên bản Debezium**: kiểm changelog xem có bug đã biết với incremental snapshot +
+   `pgoutput` + `REPLICA IDENTITY FULL`.
+
+### Điều kiện đóng issue (không đổi)
+
+Thấy `op='r'` **thật sự về tới Bronze**, và `audit_reconciliation` vẫn lệch **0**.

@@ -4,7 +4,8 @@
 #
 #   bash scripts/cdc_resnapshot.sh public.merchants
 #   bash scripts/cdc_resnapshot.sh public.accounts public.merchants
-#   bash scripts/cdc_resnapshot.sh --status          # xem signal đã gửi
+#   bash scripts/cdc_resnapshot.sh --status          # xem signal đã gửi + trạng thái connector
+#   bash scripts/cdc_resnapshot.sh --reset           # dọn state snapshot kẹt (giữ vị trí WAL)
 #
 # ⭐ ĐÂY LÀ NỬA CÒN THIẾU CỦA RỦI RO CDC #1 (issue 003).
 #   `max_slot_wal_keep_size=10GB` cố ý HY SINH replication slot để cứu DB nguồn
@@ -57,7 +58,54 @@ for t in d.get('tasks',[]):
     || echo "  (không đọc được — Kafka Connect chưa lên?)"
 }
 
+reset_state() {
+  # Gỡ state snapshot kẹt khỏi offset của connector.
+  #
+  # VÌ SAO CẦN (phát hiện 05-08): signal `stop-snapshot` KHÔNG dọn được state.
+  # Debezium log "Requested stop of snapshot" nhưng `incremental_snapshot_collections`
+  # vẫn còn nguyên trong offset — và khi còn nguyên thì MỌI yêu cầu snapshot sau đó
+  # bị CHẶN IM LẶNG: signal được nhận, không lỗi, không log, không chạy. Mất khá lâu
+  # mới nhận ra vì mọi dấu hiệu bề mặt đều bình thường.
+  #
+  # Chỉ gỡ các khoá `incremental_snapshot_*`, GIỮ NGUYÊN lsn/txId/ts_usec -> không
+  # mất vị trí WAL, không phải snapshot lại từ đầu.
+  echo "== DỌN STATE SNAPSHOT KẸT =="
+  echo "[1/3] dừng connector..."
+  curl -s -X PUT "http://localhost:8083/connectors/$CONNECTOR/stop" >/dev/null
+  for _ in $(seq 1 15); do
+    [ "$(curl -s "http://localhost:8083/connectors/$CONNECTOR/status" \
+        | python3 -c 'import json,sys;print(json.load(sys.stdin)["connector"]["state"])' 2>/dev/null)" = "STOPPED" ] && break
+    sleep 2
+  done
+
+  echo "[2/3] gỡ khoá incremental_snapshot_* (giữ vị trí WAL)..."
+  curl -s "http://localhost:8083/connectors/$CONNECTOR/offsets" | python3 -c "
+import json, sys
+d = json.load(sys.stdin); o = d['offsets'][0]
+o['offset'] = {k: v for k, v in o['offset'].items() if not k.startswith('incremental_snapshot')}
+print(json.dumps({'offsets': [o]}))" \
+    | curl -s -X PATCH -H "Content-Type: application/json" --data @- \
+      "http://localhost:8083/connectors/$CONNECTOR/offsets" >/dev/null
+
+  echo "[3/3] bật lại connector..."
+  curl -s -X PUT "http://localhost:8083/connectors/$CONNECTOR/resume" >/dev/null
+  for _ in $(seq 1 20); do
+    [ "$(curl -s "http://localhost:8083/connectors/$CONNECTOR/status" \
+        | python3 -c 'import json,sys;print(json.load(sys.stdin)["connector"]["state"])' 2>/dev/null)" = "RUNNING" ] && break
+    sleep 2
+  done
+
+  left=$(curl -s "http://localhost:8083/connectors/$CONNECTOR/offsets" \
+        | python3 -c "
+import json,sys
+o=json.load(sys.stdin)['offsets'][0]['offset']
+print(','.join(k for k in o if k.startswith('incremental')) or 'SẠCH')" 2>/dev/null)
+  echo
+  echo "khoá incremental còn lại: $left"
+}
+
 [ "${1:-}" = "--status" ] && { show_status; exit 0; }
+[ "${1:-}" = "--reset" ]  && { reset_state; exit 0; }
 [ $# -eq 0 ] && { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
 # Kiểm connector còn sống TRƯỚC khi gửi: signal vào một topic mà không ai đọc thì

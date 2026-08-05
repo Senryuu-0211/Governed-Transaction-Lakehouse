@@ -1,6 +1,6 @@
 # Issue #001 — Xung đột port observability (9090 / 3000)
 
-**Trạng thái:** OPEN
+**Trạng thái:** ✅ ĐÃ ĐÓNG (01-08) — chọn phương án 1, xem cuối file
 **Phát hiện:** Phase 1 Step 1a (2026-07-08)
 **Ảnh hưởng:** Phase 5 (Observability) — CHƯA chặn hiện tại
 **Mức:** Medium (kiến trúc, cần quyết định trước Phase 5)
@@ -29,3 +29,22 @@ $ ss -ltn | grep -E ':9090|:3000'
 ## Ghi chú
 - Loki (:3100) mà plan dự định thì hiện chưa ai chiếm → OK.
 - Xem thêm `PORTS.md` (bảng port tổng).
+
+
+---
+
+## ✅ Đã đóng 01-08-2026 — chọn phương án 1
+
+Phase 5 làm đúng **phương án 1** đề xuất ở trên: **tái dùng monitoring stack có sẵn**, không
+dựng Prometheus/Grafana thứ hai. Cụ thể:
+
+- `scripts/metrics_exporter.py` ghi file `.prom` → **textfile collector của `node_exporter`
+  đang chạy sẵn 24/7** đọc → Prometheus → Grafana. Không thêm cổng nào, không thêm daemon nào.
+- Dashboard `GTL · Pipeline Health` + 9 luật alert nằm trong Grafana `:3000` đang có.
+- Đã kiểm chứng **không phá thứ đang chạy**: sau khi restart `node-exporter`, dashboard host vẫn
+  đủ **1.354 series** cpu/mem/disk/net, và `node_textfile_scrape_error = 0`.
+
+Xung đột port biến mất vì **không có gì mới cần bind port**. Đúng như ghi chú "tiết kiệm RAM,
+một nơi xem tất cả, không over-provision".
+
+Chi tiết: `docs/observability.md`.
