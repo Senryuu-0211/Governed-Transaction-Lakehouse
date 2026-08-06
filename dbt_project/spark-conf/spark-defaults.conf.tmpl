@@ -18,10 +18,12 @@ spark.sql.extensions                         org.apache.iceberg.spark.extensions
 spark.sql.catalog.gtl                        org.apache.iceberg.spark.SparkCatalog
 spark.sql.catalog.gtl.type                   rest
 spark.sql.catalog.gtl.uri                    http://localhost:8181
-# 28-07: S3 THẬT (bỏ MinIO) — không còn s3.endpoint / path-style-access.
+# 06-08: HAI CHẾ ĐỘ. scripts/dbt.sh sinh hai dòng endpoint/path-style CHỈ KHI
+# .env có S3_ENDPOINT (MinIO). Để trống -> AWS S3 thật, SDK tự resolve theo region.
 spark.sql.catalog.gtl.warehouse              s3://__S3_BUCKET__/warehouse/
 spark.sql.catalog.gtl.io-impl                org.apache.iceberg.aws.s3.S3FileIO
 spark.sql.catalog.gtl.client.region          __AWS_REGION__
+__S3_ENDPOINT_CONF__
 spark.sql.defaultCatalog                     gtl
 
 # Derby metastore RIÊNG cho mỗi lần chạy (scripts/dbt.sh render vào thư mục tạm).

@@ -25,33 +25,20 @@ VÌ SAO CẦN (bài học 28-07):
 import pathlib
 import sys
 
-import boto3
-
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT / "spark"))
+from gtl_session import s3_client  # noqa: E402
+
 GB = 1024 ** 3
 # Giá S3 Standard us-east-1 (tham khảo, để ước lượng — không phải hoá đơn thật)
 USD_PER_GB_MONTH = 0.023
 
 
-def load_env() -> dict:
-    env = {}
-    for line in (PROJECT_ROOT / ".env").read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            key, _, value = line.partition("=")
-            env[key.strip()] = value.strip()
-    return env
 
 
 def client_and_bucket():
-    env = load_env()
-    s3 = boto3.client(
-        "s3",
-        region_name=env["AWS_DEFAULT_REGION"],
-        aws_access_key_id=env["AWS_ACCESS_KEY_ID"],
-        aws_secret_access_key=env["AWS_SECRET_ACCESS_KEY"],
-    )
-    return s3, env["S3_BUCKET"]
+    """Endpoint do gtl_session quyết định: MinIO (S3_ENDPOINT có) hay AWS thật."""
+    return s3_client()
 
 
 def apply_lifecycle() -> int:

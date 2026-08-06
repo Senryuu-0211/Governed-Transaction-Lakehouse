@@ -47,11 +47,10 @@ import tempfile
 import time
 from pathlib import Path
 
-import boto3
 import psycopg2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "spark"))
-from gtl_session import PROJECT_ROOT, load_env  # noqa: E402
+from gtl_session import PROJECT_ROOT, load_env, s3_client  # noqa: E402
 
 OUT_DIR = Path(os.environ.get("GTL_METRICS_DIR", Path.home() / "working" / "metrics"))
 OUT_FILE = OUT_DIR / "gtl.prom"
@@ -252,11 +251,7 @@ def collect_s3(env: dict) -> list:
         return [("gtl_s3_bytes", {}, c["bytes"]), ("gtl_s3_objects", {}, c["objects"]),
                 ("gtl_s3_measured_age_seconds", {}, int(now - S3_CACHE.stat().st_mtime))]
 
-    s3 = boto3.client(
-        "s3", region_name=env["AWS_DEFAULT_REGION"],
-        aws_access_key_id=env["AWS_ACCESS_KEY_ID"],
-        aws_secret_access_key=env["AWS_SECRET_ACCESS_KEY"],
-    )
+    s3, _bucket = s3_client()
     total_bytes = total_objects = 0
     for page in s3.get_paginator("list_objects_v2").paginate(
         Bucket=env["S3_BUCKET"], Prefix="warehouse/"

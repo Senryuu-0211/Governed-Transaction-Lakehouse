@@ -39,9 +39,20 @@ trap 'rm -rf "$RUN_DIR"' EXIT
 export SPARK_CONF_DIR="$RUN_DIR/conf"
 mkdir -p "$SPARK_CONF_DIR"
 
+# Hai dòng endpoint CHỈ sinh ra khi .env có S3_ENDPOINT (chế độ MinIO). Chạy AWS
+# S3 thật thì để trống -> không dòng nào được thêm, SDK tự resolve theo region.
+# Cùng một template phục vụ cả hai chế độ, không phải hai file cấu hình song song.
+if [ -n "${S3_ENDPOINT:-}" ]; then
+  ENDPOINT_CONF="spark.sql.catalog.gtl.s3.endpoint              ${S3_ENDPOINT}
+spark.sql.catalog.gtl.s3.path-style-access   true"
+else
+  ENDPOINT_CONF=""
+fi
+
 sed -e "s|__S3_BUCKET__|${S3_BUCKET}|g" \
     -e "s|__AWS_REGION__|${AWS_REGION}|g" \
     -e "s|__DERBY_HOME__|${RUN_DIR}/derby|g" \
+    -e "s|__S3_ENDPOINT_CONF__|${ENDPOINT_CONF//$'\n'/\\n}|g" \
     "$PROJECT_ROOT/dbt_project/spark-conf/spark-defaults.conf.tmpl" \
     > "$SPARK_CONF_DIR/spark-defaults.conf"
 

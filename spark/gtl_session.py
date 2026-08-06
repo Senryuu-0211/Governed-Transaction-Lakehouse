@@ -14,6 +14,7 @@ jar versions and catalog wiring can never drift apart between them.
 import os
 from pathlib import Path
 
+import boto3
 from pyspark.sql import SparkSession
 
 # --- Endpoints (host side) --------------------------------------------------
@@ -66,6 +67,31 @@ def load_env(path: Path = None) -> dict:
     return env
 
 
+
+def s3_client(config=None):
+    """Client boto3 + tên bucket — MỘT chỗ duy nhất quyết định endpoint.
+
+    Trước đây ba file tự dựng client riêng (s3_admin, metrics_exporter, maintenance),
+    mỗi chỗ lặp lại cùng bốn tham số. Khi thêm chế độ MinIO thì phải sửa cả ba — và
+    đó chính là kiểu chỗ dễ sót một cái rồi debug nhầm hướng (đã dính đúng vậy với
+    timeout: sửa cho S3FileIO mà quên boto3).
+
+    `S3_ENDPOINT` trong .env quyết định: có giá trị -> MinIO, để trống -> AWS thật.
+    """
+    env = load_env()
+    kwargs = {
+        "region_name": env.get("AWS_DEFAULT_REGION", "us-east-1"),
+        "aws_access_key_id": env["AWS_ACCESS_KEY_ID"],
+        "aws_secret_access_key": env["AWS_SECRET_ACCESS_KEY"],
+    }
+    endpoint = env.get("S3_ENDPOINT", "").strip()
+    if endpoint:
+        kwargs["endpoint_url"] = endpoint
+    if config is not None:
+        kwargs["config"] = config
+    return boto3.client("s3", **kwargs), env["S3_BUCKET"]
+
+
 def get_spark(
     app_name: str,
     master: str = "local[*]",
@@ -75,6 +101,8 @@ def get_spark(
     env = load_env()
     region = env.get("AWS_DEFAULT_REGION", "us-east-1")
     warehouse = f"s3://{env['S3_BUCKET']}/warehouse/"
+    # Rỗng/thiếu = AWS S3 thật. Có giá trị = MinIO hoặc store S3-compatible khác.
+    endpoint = env.get("S3_ENDPOINT", "").strip()
 
     # Nạp credential vào MÔI TRƯỜNG, không vào Spark conf (xem lý do ở phần config
     # bên dưới). JVM con kế thừa môi trường này, DefaultCredentialsProvider của AWS
@@ -94,24 +122,22 @@ def get_spark(
             "spark.sql.extensions",
             "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
         )
-        # --- Catalog: REST + AWS S3 THẬT (28-07: bỏ MinIO) --------------------
-        # Đúng như thiết kế hứa: chuyển sang cloud chỉ là đổi endpoint/credential,
-        # KHÔNG dòng job code nào phải sửa. Lên Glue sau này chỉ đổi `type`.
+        # --- Catalog: REST + object store nói giao thức S3 --------------------
+        # HAI CHẾ ĐỘ, MỘT ĐOẠN CODE. `S3_ENDPOINT` trong .env quyết định:
+        #   có giá trị  -> MinIO / bất kỳ store S3-compatible nào (PHẦN 1, $0, localhost)
+        #   để trống    -> AWS S3 thật (PHẦN 2, SDK tự resolve endpoint theo region)
+        # KHÔNG có nhánh if nào trong job code, không có model dbt nào phải sửa —
+        # đó chính là lời hứa "đổi endpoint là lên cloud", và giờ nó kiểm chứng được
+        # CẢ HAI CHIỀU (MinIO->S3 ngày 30-07, S3->MinIO ngày 06-08).
         .config(f"spark.sql.catalog.{CATALOG}", "org.apache.iceberg.spark.SparkCatalog")
         .config(f"spark.sql.catalog.{CATALOG}.type", "rest")
         .config(f"spark.sql.catalog.{CATALOG}.uri", REST_CATALOG_URI)
         .config(f"spark.sql.catalog.{CATALOG}.warehouse", warehouse)
         .config(f"spark.sql.catalog.{CATALOG}.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
-        # S3 thật: KHÔNG set s3.endpoint (SDK tự resolve theo region) và KHÔNG
-        # path-style — bucket được địa chỉ hoá theo virtual-host style.
-        # ⚠️ CREDENTIAL KHÔNG truyền qua `.config(...s3.secret-access-key)`.
-        # Spark đưa MỌI conf vào DÒNG LỆNH của JVM -> `ps aux` in ra secret key
-        # dạng chữ thô, ai đăng nhập được máy này cũng đọc được (đã tận mắt thấy
-        # 01-08 khi debug job treo). Thay vào đó đặt biến môi trường và để
-        # DefaultCredentialsProvider của AWS SDK tự nhặt: biến môi trường chỉ nằm
-        # trong /proc/<pid>/environ, mặc định chỉ CHỦ tiến trình đọc được.
-        # Bonus: cùng cơ chế này chạy được với IAM role khi lên EC2/EKS sau này —
-        # không phải sửa code, đúng tinh thần "đổi endpoint là lên cloud".
+        # Endpoint + path-style CHỈ set khi chạy store S3-compatible.
+        # MinIO không hỗ trợ virtual-host style (bucket.host) nên bắt buộc path-style
+        # (host/bucket); S3 thật thì ngược lại. Đây đúng là hai dòng khác biệt duy
+        # nhất giữa hai chế độ.
         .config(f"spark.sql.catalog.{CATALOG}.client.region", region)
         # --- Kết nối HTTP tới S3: BẮT BUỘC cho job dài -----------------------
         # SỰ CỐ 01-08: `maintenance.py` treo ở 0% CPU, nhiều lần, mỗi lần hàng giờ.
@@ -165,6 +191,14 @@ def get_spark(
         )
         .config("spark.sql.defaultCatalog", CATALOG)
     )
+    # Chỉ áp khi có endpoint — để trống là chạy AWS thật.
+    if endpoint:
+        builder = (
+            builder
+            .config(f"spark.sql.catalog.{CATALOG}.s3.endpoint", endpoint)
+            .config(f"spark.sql.catalog.{CATALOG}.s3.path-style-access", "true")
+        )
+
     # Job đặc thù (vd push mart qua JDBC cần driver Postgres) truyền conf thêm ở
     # đây thay vì sửa mặc định chung.
     for key, val in (extra_conf or {}).items():

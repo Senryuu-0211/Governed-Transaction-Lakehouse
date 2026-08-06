@@ -28,8 +28,26 @@ Chạy:  PYTHONPATH=spark ~/working/gtl-spark-venv/bin/python spark/maintenance.
 import sys
 from datetime import datetime, timedelta
 
-import boto3
-from gtl_session import CATALOG, get_spark, load_env
+from botocore.config import Config
+from gtl_session import CATALOG, get_spark, s3_client
+
+# Timeout cho client boto3 — CÙNG BÀI HỌC với S3FileIO, nhưng đây là một client
+# KHÁC nên phải cấu hình RIÊNG. Tôi đã sót đúng chỗ này: sửa timeout cho S3FileIO
+# rồi tưởng xong, trong khi `build_file_list_view()` vẫn gọi S3 bằng boto3 mặc định.
+# Job vẫn treo, và mất thêm một vòng debug mới nhận ra có HAI đường ra S3.
+#
+# Máy này ra Internet qua NAT gia đình: kết nối nhàn rỗi bị NAT lặng lẽ vứt bản
+# ghi ánh xạ, lần dùng lại sau đó gói tin bay vào hư không (Send-Q kẹt, không bao
+# giờ có ACK). Liệt kê 19k object với RTT 249ms là thừa thời gian cho việc đó.
+S3_CLIENT_CONFIG = Config(
+    connect_timeout=10,
+    read_timeout=60,
+    # adaptive: gặp throttle thì tự giãn nhịp thay vì đập liên tục vào S3.
+    retries={"max_attempts": 5, "mode": "adaptive"},
+    # Trần kết nối đồng thời — liệt kê phân trang không cần nhiều, giữ thấp để
+    # bớt số kết nối có thể chết già trong pool.
+    max_pool_connections=10,
+)
 
 # Nén cả Bronze (nguồn small file) lẫn Silver (MERGE cũng đẻ file). Gold=table
 # rebuild mỗi run nên không tích file — bỏ qua.
@@ -60,15 +78,8 @@ METADATA_PROPERTIES = {
 
 
 def s3_client_and_bucket():
-    """Client boto3 + tên bucket, đọc từ .env (cùng credential Spark đang dùng)."""
-    env = load_env()
-    client = boto3.client(
-        "s3",
-        region_name=env["AWS_DEFAULT_REGION"],
-        aws_access_key_id=env["AWS_ACCESS_KEY_ID"],
-        aws_secret_access_key=env["AWS_SECRET_ACCESS_KEY"],
-    )
-    return client, env["S3_BUCKET"]
+    """Client boto3 + tên bucket. Endpoint do gtl_session quyết định (MinIO/S3)."""
+    return s3_client(config=S3_CLIENT_CONFIG)
 
 
 def table_location(spark, fqn: str) -> str:
@@ -142,7 +153,109 @@ def call_orphan(spark, table: str, cutoff: str, view: str, dry_run: bool) -> lis
     ).collect()
 
 
+def data_file_count(spark, fqn: str) -> int:
+    """Số data file của bảng — đọc từ TÓM TẮT SNAPSHOT, không quét manifest.
+
+    ⚠️ ĐÂY LÀ CHỖ JOB TỪNG TREO, và nó treo vì một dòng chỉ để TRANG TRÍ LOG.
+      Bản cũ dùng `SELECT count(*) FROM <bảng>.files`. Câu đó trông vô hại nhưng
+      nó MỞ TỪNG MANIFEST để đếm — với `bronze.accounts` (6.702 object) là hàng
+      nghìn request S3, mỗi request 249ms khứ hồi tới us-east-1, qua NAT gia đình
+      hay thả kết nối nhàn rỗi. Job treo ở Stage 0, tức là TRƯỚC KHI nén một file
+      nào: chết vì đi đếm, không phải vì đi làm.
+
+    Iceberg đã ghi sẵn con số này trong `summary` của mỗi snapshot. Đọc nó chỉ tốn
+    MỘT lần đọc metadata.json — thay vì hàng nghìn.
+
+    Không đọc được thì trả -1 và ĐI TIẾP: đây là số liệu báo cáo, không phải điều
+    kiện để nén. Đừng bao giờ để phần trang trí chặn phần công việc.
+    """
+    try:
+        rows = spark.sql(
+            f"SELECT summary['total-data-files'] AS n FROM {fqn}.snapshots "
+            f"ORDER BY committed_at DESC LIMIT 1"
+        ).collect()
+        return int(rows[0]["n"]) if rows and rows[0]["n"] is not None else -1
+    except Exception:  # noqa: BLE001
+        return -1
+
+
+def maintain_table(spark, s3, bucket, table: str) -> str:
+    """Bảo trì MỘT bảng. Trả về dòng tóm tắt để in.
+
+    Tách riêng khỏi `main()` để một bảng hỏng không giết cả lượt chạy — xem lý do
+    ở phần bắt lỗi trong main().
+    """
+    fqn = f"{CATALOG}.{table}"
+
+    # 0) Vá property dọn metadata TRƯỚC (idempotent). Đặt trước compaction để
+    #    chính các commit của bước nén cũng được dọn metadata ngay.
+    for key, value in METADATA_PROPERTIES.items():
+        spark.sql(f"ALTER TABLE {fqn} SET TBLPROPERTIES ('{key}'='{value}')")
+    before = data_file_count(spark, fqn)
+
+    # 1) Nén small file. min-input-files=2 để bảng đã gọn thì bỏ qua (no-op).
+    rc = spark.sql(
+        f"CALL {CATALOG}.system.rewrite_data_files("
+        f"  table => '{table}',"
+        f"  options => map("
+        f"    'target-file-size-bytes','{TARGET_FILE_BYTES}',"
+        f"    'min-input-files','5',"
+        # Commit theo TỪNG NHÓM file thay vì gom cả bảng vào một plan khổng lồ
+        # (tránh OOM); nhóm dở vẫn giữ được tiến độ nếu một nhóm lỗi.
+        f"    'partial-progress.enabled','true',"
+        f"    'max-file-group-size-bytes','{256 * 1024 * 1024}'"
+        f"  ))"
+    ).collect()[0]
+    rewritten = rc["rewritten_data_files_count"]
+    added = rc["added_data_files_count"]
+
+    # 2) Dọn snapshot cũ + file đã hết tham chiếu (giữ RETAIN_SNAPSHOTS gần nhất).
+    spark.sql(
+        f"CALL {CATALOG}.system.expire_snapshots("
+        f"  table => '{table}',"
+        f"  retain_last => {RETAIN_SNAPSHOTS})"
+    )
+
+    # 3) Dọn file MỒ CÔI (ghi xong nhưng commit fail -> không snapshot nào trỏ tới).
+    #    Bước 2 KHÔNG thấy loại này. Đây là bước thiếu đã gây 397GB rác.
+    #    Danh sách file do BOTO3 cung cấp (xem build_file_list_view: Iceberg 1.9.2
+    #    liệt kê bằng Hadoop FS, mà project không dùng hadoop-aws).
+    orphan_cutoff = (datetime.now() - timedelta(hours=ORPHAN_OLDER_THAN_HOURS)) \
+        .strftime("%Y-%m-%d %H:%M:%S")
+    view = f"file_list_{table.replace('.', '_')}"
+    listed = build_file_list_view(spark, s3, bucket, table_location(spark, fqn), view)
+
+    # DRY-RUN trước: đây là code XOÁ FILE trong lakehouse. Nếu nó định xoá một
+    # lượng vô lý (vd gần bằng toàn bộ file đã liệt kê) thì gần như chắc chắn
+    # logic đối chiếu sai -> BỎ QUA, để người xem lại, thà giữ rác còn hơn mất data.
+    planned = call_orphan(spark, table, orphan_cutoff, view, dry_run=True)
+    if planned and len(planned) > 0.5 * max(listed, 1):
+        print(f"{table:24s} ⚠️  BỎ QUA dọn mồ côi: định xoá {len(planned):,}/{listed:,} "
+              f"file (>50%) — nghi đối chiếu sai, cần xem lại thủ công")
+        orphans = []
+    else:
+        orphans = call_orphan(spark, table, orphan_cutoff, view, dry_run=False)
+
+    after = data_file_count(spark, fqn)
+    return (f"{table:24s} files {before:>6,} -> {after:>4,}  "
+        f"(rewrote {rewritten:,} -> {added:,}, "
+        f"liệt kê {listed:,}, orphan xoá {len(orphans):,})")
+
+
 def main() -> int:
+    # Cho phép chạy TỪNG BẢNG:  python spark/maintenance.py bronze.merchants
+    #
+    # VÌ SAO CẦN (bài học 05-08): job này bị treo/giết 6 lần liên tiếp và CHƯA BAO
+    # GIỜ chạy trọn 6 bảng. Mỗi lần treo là mất toàn bộ lượt chạy, kể cả những bảng
+    # đã xong. Khi một thao tác không đáng tin, cách chữa không phải là làm nó đáng
+    # tin hơn bằng mọi giá — mà là THU NHỎ ĐƠN VỊ CÔNG VIỆC để một lần hỏng chỉ tốn
+    # một bảng. Bảng lớn nhất chạy riêng, bảng nhỏ gom lại.
+    tables = sys.argv[1:] or TABLES
+    unknown = [x for x in tables if x not in TABLES]
+    if unknown:
+        print(f"❌ bảng không có trong danh sách: {unknown}\n   hợp lệ: {TABLES}")
+        return 2
+
     spark = get_spark(
         "gtl-maintenance", master="local[4]", driver_memory="6g",
         # Nén 4400+ file một lượt làm OOM khi broadcast — tắt broadcast join cho job này.
@@ -150,67 +263,23 @@ def main() -> int:
     )
     s3, bucket = s3_client_and_bucket()
 
-    for table in TABLES:
-        fqn = f"{CATALOG}.{table}"
-
-        # 0) Vá property dọn metadata TRƯỚC (idempotent). Đặt trước compaction để
-        #    chính các commit của bước nén cũng được dọn metadata ngay.
-        for key, value in METADATA_PROPERTIES.items():
-            spark.sql(f"ALTER TABLE {fqn} SET TBLPROPERTIES ('{key}'='{value}')")
-        # Số file TRƯỚC (chứng minh hiệu quả nén)
-        before = spark.sql(f"SELECT count(*) n FROM {fqn}.files").collect()[0]["n"]
-
-        # 1) Nén small file. min-input-files=2 để bảng đã gọn thì bỏ qua (no-op).
-        rc = spark.sql(
-            f"CALL {CATALOG}.system.rewrite_data_files("
-            f"  table => '{table}',"
-            f"  options => map("
-            f"    'target-file-size-bytes','{TARGET_FILE_BYTES}',"
-            f"    'min-input-files','5',"
-            # Commit theo TỪNG NHÓM file thay vì gom cả bảng vào một plan khổng lồ
-            # (tránh OOM); nhóm dở vẫn giữ được tiến độ nếu một nhóm lỗi.
-            f"    'partial-progress.enabled','true',"
-            f"    'max-file-group-size-bytes','{256 * 1024 * 1024}'"
-            f"  ))"
-        ).collect()[0]
-        rewritten = rc["rewritten_data_files_count"]
-        added = rc["added_data_files_count"]
-
-        # 2) Dọn snapshot cũ + file đã hết tham chiếu (giữ RETAIN_SNAPSHOTS gần nhất).
-        spark.sql(
-            f"CALL {CATALOG}.system.expire_snapshots("
-            f"  table => '{table}',"
-            f"  retain_last => {RETAIN_SNAPSHOTS})"
-        )
-
-        # 3) Dọn file MỒ CÔI (ghi xong nhưng commit fail -> không snapshot nào trỏ tới).
-        #    Bước 2 KHÔNG thấy loại này. Đây là bước thiếu đã gây 397GB rác.
-        #    Danh sách file do BOTO3 cung cấp (xem build_file_list_view: Iceberg 1.9.2
-        #    liệt kê bằng Hadoop FS, mà project không dùng hadoop-aws).
-        orphan_cutoff = (datetime.now() - timedelta(hours=ORPHAN_OLDER_THAN_HOURS)) \
-            .strftime("%Y-%m-%d %H:%M:%S")
-        view = f"file_list_{table.replace('.', '_')}"
-        listed = build_file_list_view(spark, s3, bucket, table_location(spark, fqn), view)
-
-        # DRY-RUN trước: đây là code XOÁ FILE trong lakehouse. Nếu nó định xoá một
-        # lượng vô lý (vd gần bằng toàn bộ file đã liệt kê) thì gần như chắc chắn
-        # logic đối chiếu sai -> BỎ QUA, để người xem lại, thà giữ rác còn hơn mất data.
-        planned = call_orphan(spark, table, orphan_cutoff, view, dry_run=True)
-        if planned and len(planned) > 0.5 * max(listed, 1):
-            print(f"{table:24s} ⚠️  BỎ QUA dọn mồ côi: định xoá {len(planned):,}/{listed:,} "
-                  f"file (>50%) — nghi đối chiếu sai, cần xem lại thủ công")
-            orphans = []
-        else:
-            orphans = call_orphan(spark, table, orphan_cutoff, view, dry_run=False)
-
-        after = spark.sql(f"SELECT count(*) n FROM {fqn}.files").collect()[0]["n"]
-        print(f"{table:24s} files {before:>6,} -> {after:>4,}  "
-              f"(rewrote {rewritten:,} -> {added:,}, "
-              f"liệt kê {listed:,}, orphan xoá {len(orphans):,})")
+    ok, failed = [], []
+    for table in tables:
+        try:
+            print(maintain_table(spark, s3, bucket, table), flush=True)
+            ok.append(table)
+        except Exception as exc:  # noqa: BLE001
+            # CỐ Ý bắt rộng và ĐI TIẾP. Bảo trì là việc dọn dẹp: một bảng lỗi không
+            # có lý do gì ngăn 5 bảng còn lại được dọn. Chết cả lượt vì một bảng
+            # chính là kiểu hỏng đã khiến job này không bao giờ hoàn thành.
+            print(f"{table:24s} ❌ LỖI: {type(exc).__name__}: {str(exc)[:160]}", flush=True)
+            failed.append(table)
 
     spark.stop()
-    print("\nDONE — compaction + snapshot expiry + orphan cleanup xong")
-    return 0
+    print(f"\nDONE — xong {len(ok)}/{len(tables)} bảng"
+          + (f" · LỖI: {failed}" if failed else ""))
+    # Trả mã lỗi nếu có bảng hỏng: chạy trong Airflow thì task phải đỏ, không im lặng.
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
