@@ -4,6 +4,178 @@ Nhật ký để resume nhanh sau khi context bị nén. Mới nhất ở trên.
 
 ---
 
+## 06-08-2026 (chiều) — Đóng issue #003: thừa một phần trong tên bảng signal
+
+Lỗ hổng cuối của PHẦN 1. Mở từ 20-07, ba buổi điều tra, hôm nay xong trong một buổi nhờ đo
+**từ phía Postgres** thay vì tin lời Debezium tự thuật.
+
+### Gốc rễ
+
+`signal.data.collection` ghi `banking.public.debezium_signal` (ba phần). Postgres cần **hai
+phần**. Sửa một dòng thành `public.debezium_signal`.
+
+Cơ chế: `CommonConnectorConfig` parse chuỗi thành `TableId` rồi so bằng `equals()`, mà
+`equals()` so chuỗi `id` — được nối từ các phần và **bỏ qua phần null**. pgoutput lại dựng
+TableId cho mọi bảng với `catalog = null` (`PgOutputMessageDecoder.java:305`). Ba phần cho
+`banking.public.debezium_signal`, bảng thật cho `public.debezium_signal` → không bao giờ khớp.
+
+### Vì sao im lặng đến thế
+
+Chuỗi sai vẫn **trỏ đúng bảng khi GHI**, chỉ hỏng **khi NHẬN DIỆN**. Nên:
+
+```
+signal nhận được          ✅  →  watermark open ghi vào bảng      ✅
+chunk đọc trọn 50 dòng    ✅  →  watermark close ghi vào bảng     ✅
+dòng close qua WAL ra Kafka ✅ →  isSignalDataCollection() = false ❌  ← hỏng ở đây
+                                  closeWindow() không chạy
+                                  50 dòng trong buffer bị VỨT IM LẶNG
+                                  primary_key đứng null → snapshot treo → chặn mọi lệnh sau
+```
+
+Không một dòng log lỗi nào ở bất kỳ bước nào.
+
+### Cách phá thế bí
+
+`ALTER SYSTEM SET log_statement='all'` trên Postgres 25 giây, bắn signal, grep. Bắt được
+nguyên văn câu chunk:
+
+```sql
+SELECT * FROM "public"."merchants" ORDER BY "merchant_id" LIMIT 1024
+```
+
+Câu này **chạy và trả về đủ 50 dòng**. Đó là lúc lật ngược được kết luận cũ.
+
+Ghi chú: bật DEBUG qua `/admin/loggers` lúc đang chạy **vô dụng** — Connect chấp nhận
+(`Setting level of namespace ... to DEBUG`) nhưng appender log4j chặn ở ngưỡng INFO nên
+không in ra dòng nào. Muốn DEBUG thật phải đặt trong compose rồi restart.
+
+### 🔴 Hai kết luận cũ trong issue #003 là SAI
+
+1. *"Lỗi nằm ở bước đọc chunk — nó trả về rỗng"* — **sai**, chunk đọc đủ 50 dòng.
+2. *"Cửa sổ watermark mở/đóng bình thường, lỗi không nằm ở đó"* — **sai một nửa**: ghi thì
+   được, đọc lại thì không. Hiểu nhầm này khiến vùng nghi ngờ loại bỏ đúng chỗ đang hỏng.
+
+Cùng một dạng sai: **suy ra một bước từ kết quả của bước khác**. Đây là lần thứ hai trong
+tuần mắc đúng lỗi này (lần trước là issue #006 — xem mục dưới).
+
+### Bằng chứng đóng
+
+```
+topic gtl.public.merchants   50 → 150 → 200   (xả backlog + signal mới)
+message cuối                 snapshot = "incremental"
+offset sau khi xong          SẠCH — tự kết thúc, tự dọn state
+bronze.merchants  200 dòng / 50 khoá   ← 4 bản mỗi merchant, đúng thiết kế
+silver.merchants   50 dòng / 50 khoá   ← khử trùng theo _kafka_offset
+dbt build                    91 PASS / 0 ERROR / 0 WARN (84s)
+đối soát 13:11:49            2.692.703 txn · $11.207.350.475,15 · lệch $0,00
+```
+
+Lớp bảo vệ số 2 của CDC risk #1 giờ **thật sự dùng được**, không còn nằm trên giấy.
+
+### Bài học
+
+- Định dạng tên bảng trong config Debezium **khác nhau theo từng connector** (Postgres 2
+  phần, MySQL 2 phần khác nghĩa, SQL Server 3 phần). Chép nhầm quy ước → **hỏng im lặng**,
+  không phải lỗi cấu hình.
+- Một chuỗi config có thể **vừa đúng vừa sai cùng lúc**: đúng khi dựng câu SQL, sai khi so
+  khớp. Không kiểm tra khởi động nào bắt được.
+- Khi mọi bước đều báo thành công mà kết quả không có: **đo từ phía khác**.
+
+---
+
+## 05/06-08-2026 — Quay lại MinIO cho PHẦN 1: giải lỗ hổng bằng cách BỎ NGUYÊN NHÂN
+
+Định chạy trọn `maintenance.py` để đóng sổ project. Hai ngày sau mới xong — và cách xong
+không phải cách đã dự tính.
+
+### Đuổi theo triệu chứng, thất bại 5 lần
+
+`maintenance.py` treo vô hạn trên 2 bảng Bronze (~6.800 object/bảng), JVM **0% CPU** — không
+phải chậm, mà là **đang chờ**. `ss -tnp` chỉ ra một socket tới S3 kẹt với **đúng ~1001 byte
+chưa được ACK**, lặp lại y hệt qua mọi lần thử.
+
+| Giả thuyết | Kết quả |
+|---|---|
+| Mạng hỏng | ❌ 0% mất gói · boto3 lấy 1000 key trong **2,2s** |
+| Thiếu socket timeout | ❌ đặt 60s — vô tác dụng: `SO_TIMEOUT` chỉ áp cho **đọc**, luồng kẹt ở **ghi** |
+| Kết nối pool chết già vì NAT | ❌ idle 30s + TTL + reaper + keepalive — vẫn kẹt |
+| Câu đếm manifest quá đắt | ✅ **đúng một phần** |
+| `tcp_retries2=15` quá kiên nhẫn | ❌ hạ xuống 8 (~30s) — **vẫn kẹt sau 20 phút** |
+
+Điểm cuối là quan trọng nhất: `retries2=8` lẽ ra phải giết socket chết trong 30 giây mà không
+giết được → **không phải socket chết**, mà phía bên kia ngừng đọc. Không timeout nào ở tầng
+ứng dụng phá được thế đó.
+
+### Sửa được 3 thứ thật (độc lập với storage backend)
+
+1. **`data_file_count()` bỏ quét manifest.** Bản cũ `SELECT count(*) FROM <bảng>.files` **chỉ để
+   in log cho đẹp**, nhưng nó mở TỪNG manifest → hàng nghìn request. Job chết ở **Stage 0**, tức
+   chết vì đi *đếm*, chưa hề bắt đầu *nén*. Đổi sang đọc `summary['total-data-files']` của
+   snapshot = **một** lần đọc. → *Đừng để phần trang trí chặn phần công việc.*
+2. **Cô lập lỗi theo từng bảng** + nhận `argv` + exit code. Trước đó một bảng hỏng giết cả lượt,
+   kể cả bảng đã xong — job bị treo/giết **7 lần liên tiếp**, chưa bao giờ hoàn thành.
+   → *Khi một thao tác không đáng tin, thu nhỏ ĐƠN VỊ CÔNG VIỆC, đừng ép nó đáng tin.*
+3. **Timeout cho boto3.** Tôi từng sót đúng chỗ này: sửa cho S3FileIO rồi tưởng xong, trong khi
+   `build_file_list_view()` vẫn dùng boto3 mặc định. **Có HAI đường ra S3.**
+
+### 🔴 Nhưng gốc rễ là lỗi thiết kế của chính project
+
+`trigger = 5 giây` ban đầu đẻ **~17.000 file/ngày/bảng**. Đã sửa thành 30s, nhưng **nợ cũ còn
+nguyên** — và chính nó chặn công cụ sinh ra để dọn nó.
+
+Mr. Senryuu chất vấn thẳng: *"quả nhiên S3 là một lựa chọn sai lầm?"* Câu trả lời trung thực:
+**không** — thứ sai là **compute ở nhà + storage trên mây**, một thể lai không nằm trong kế
+hoạch nào, lấy nhược điểm của cả hai. Và lỗi kiến trúc thật là ngày 30-07 ta **xoá hẳn MinIO**
+thay vì giữ nó làm profile local, xoá luôn cấu hình on-premise mà không ai nhận ra.
+
+### Quyết định: MinIO cho PHẦN 1, S3 để dành PHẦN 2
+
+`S3_ENDPOINT` trong `.env` quyết định chế độ — **không nhánh `if` nào trong job code**.
+
+Kết quả sau khi dựng lại từ Kafka:
+
+| | S3 (cũ) | MinIO (mới) |
+|---|---|---|
+| Object | 14.404 | **259** |
+| TB/object | 249 KB | **2.085 KB** |
+| Dữ liệu | 683K txn | **2,35M txn** |
+
+**Nhiều dữ liệu gấp 3,4 lần nhưng ít hơn 55 lần số file** — bằng chứng núi file kia chưa bao giờ
+do dữ liệu, mà do trigger 5s chạy ba tuần.
+
+- `dbt build` **91 PASS / 0 ERROR trong 85 giây**, không sửa một dòng model nào
+- Đối soát **2.349.271 txn / $9.779.102.287,86 / lệch $0,00**
+- `maintenance.py` **6/6 bảng, exit 0, ngay cả khi stream đang ghi** (45→4 file)
+- Bucket MinIO có **hạn mức cứng 300GB** — lớp bảo vệ mà sự cố 397GB đã thiếu
+- Bucket S3 cũ **nguyên vẹn 14.404 object**, giữ cho PHẦN 2
+
+> **Bài học lớn nhất: vấn đề không được SỬA — nó bị LOẠI BỎ.** Hàng giờ chữa triệu chứng đều
+> thất bại vì tất cả đều là hệ quả. Khi mọi cách chữa triệu chứng đều thất bại, thường là đang
+> chữa nhầm chỗ.
+
+Lời hứa endpoint-swap giờ kiểm chứng được **cả hai chiều**: MinIO→S3 (30-07, 82 PASS) và
+S3→MinIO (06-08, 91 PASS).
+
+### Issue
+
+- **#001 ĐÓNG** — Phase 5 đã làm đúng phương án 1 mà chính issue đề xuất (tái dùng monitoring
+  stack), chỉ chưa ai đánh dấu.
+- **#006 ĐÓNG** — bằng cách bỏ nguyên nhân, không chữa triệu chứng.
+- **#003 CÒN DỞ** — hạ tầng signal đầy đủ và hoạt động (signal tới nơi, watermark open/close đi
+  qua WAL), nhưng **truy vấn chunk trả về rỗng**, `primary_key` không rời `null`. Phát hiện thêm:
+  `stop-snapshot` KHÔNG dọn được state kẹt, và state kẹt thì **chặn im lặng** mọi yêu cầu sau đó
+  → thêm `cdc_resnapshot.sh --reset` (PATCH offsets, giữ nguyên vị trí WAL).
+  Mr. Senryuu thu hẹp phạm vi đúng: **dim** snapshot toàn bộ (rẻ), **fact** backfill có điều kiện
+  theo cửa sổ — không bao giờ toàn bảng.
+
+### Còn nợ
+
+`.env.example` **chưa cập nhật** cho dual-mode (thiếu `S3_ENDPOINT`, `STORAGE_QUOTA`). CI vẫn
+xanh vì compose có default — nhưng người clone repo về sẽ không biết cách chuyển chế độ. Đúng
+loại lỗi tài liệu mà CI từng bắt hôm 01-08.
+
+---
+
 ## 01-08-2026 (tối) — Hai lỗi nghiêm trọng lộ ra khi debug một job treo
 
 Đang chờ `maintenance.py` chạy xong thì thấy nó **đứng yên**. Kéo sợi chỉ đó ra được hai thứ,

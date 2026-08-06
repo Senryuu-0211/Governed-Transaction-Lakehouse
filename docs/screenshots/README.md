@@ -8,9 +8,9 @@ số liệu tươi). Ảnh chụp lúc mọi thứ đang tắt thì phản tác 
 
 | File cần có | Chụp ở đâu | Khung hình nên lấy |
 |---|---|---|
-| `grafana-pipeline-health.png` | Grafana → folder **GTL Pipeline** → dashboard **GTL · Pipeline Health**, đặt khoảng thời gian **6 giờ** | Lấy trọn hàng 6 stat tile trên cùng + hai biểu đồ ngay dưới. Đó là phần kể được câu chuyện: WAL slot, độ tươi Bronze, mép retention, S3 |
+| `grafana-pipeline-health.png` | Grafana → folder **GTL Pipeline** → dashboard **GTL · Pipeline Health**, đặt khoảng thời gian **6 giờ** | Lấy trọn hàng 6 stat tile trên cùng + hai biểu đồ ngay dưới. Đó là phần kể được câu chuyện: WAL slot, độ tươi Bronze, mép retention, dung lượng kho |
 | `superset-marts.png` | Superset `:8088` → một dashboard trên các bảng mart | Ưu tiên biểu đồ có **số tiền** và **xu hướng theo ngày** — nó cho thấy người dùng nghiệp vụ tự trả lời được câu hỏi, đúng mục tiêu cuối của project |
-| `airflow-dag.png` | Airflow `:8085` → DAG **`gtl_transform`** → tab **Graph** | Phải nhìn rõ `dbt_test` nằm TRƯỚC `push_marts` — đó chính là bằng chứng "test là cổng", không phải báo cáo |
+| `airflow-dag.png` | Airflow **`:8081`** → DAG **`gtl_transform`** → tab **Graph** | Phải nhìn rõ `dbt_test` nằm TRƯỚC `push_marts` — đó chính là bằng chứng "test là cổng", không phải báo cáo |
 
 ## Vài lưu ý để ảnh không phản tác dụng
 

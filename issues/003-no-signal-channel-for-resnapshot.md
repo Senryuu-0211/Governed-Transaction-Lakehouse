@@ -1,8 +1,9 @@
 # Issue #003 — Chưa có signal channel: phương án phục hồi của CDC risk #1 mới nằm trên giấy
 
-**Trạng thái:** 🟡 ĐANG LÀM DỞ — hạ tầng đã dựng và hoạt động, chunk chưa phát ra dòng nào
+**Trạng thái:** ✅ **ĐÃ ĐÓNG 06-08-2026** — gốc rễ: `signal.data.collection` ghi ba phần
+thay vì hai. Xem mục cuối file.
 **Phát hiện:** Phase 1 Step 1c (2026-07-20)
-**Cập nhật:** 2026-08-02 — xem mục "Tiến độ 02-08" ở cuối
+**Cập nhật:** 2026-08-02, 2026-08-05, **2026-08-06 (đóng)**
 **Ảnh hưởng:** Phase 5 (ops readiness) — CHƯA chặn hiện tại
 **Mức:** Medium (nợ vận hành, không phải bug)
 
@@ -218,3 +219,123 @@ tiến → lặp lại. Bảng `merchants` có 50 dòng và `debezium` có `SELE
 ### Điều kiện đóng issue (không đổi)
 
 Thấy `op='r'` **thật sự về tới Bronze**, và `audit_reconciliation` vẫn lệch **0**.
+
+
+---
+
+## ✅ ĐÓNG 06-08 — gốc rễ: một chuỗi cấu hình thừa một phần
+
+### Sửa gì
+
+`debezium/connector-config.json`, đúng một dòng:
+
+```diff
+-    "signal.data.collection": "banking.public.debezium_signal",
++    "signal.data.collection": "public.debezium_signal",
+```
+
+### Vì sao ba phần thì hỏng
+
+Chuỗi này được `CommonConnectorConfig` (dòng 1217) đưa qua `TableId.parse()`, rồi so với
+bảng trong luồng bằng `equals()`:
+
+```java
+// CommonConnectorConfig.java:1641
+public boolean isSignalDataCollection(DataCollectionId dataCollectionId) {
+    return signalingDataCollectionId != null && signalingDataCollectionId.equals(dataCollectionId);
+}
+```
+
+`TableId.equals()` → `compareTo()` → so **chuỗi `id`**, mà `id` được dựng bằng cách nối các
+phần và **bỏ qua phần null** (`TableId.java:290`). Trong khi đó pgoutput dựng TableId cho
+**mọi** bảng Postgres với `catalog = null`:
+
+```java
+// PgOutputMessageDecoder.java:305
+final TableId tableId = new TableId(null, schemaName, tableName);
+```
+
+| | catalog | schema | table | chuỗi `id` |
+|---|---|---|---|---|
+| Bảng trong stream | `null` | `public` | `debezium_signal` | `public.debezium_signal` |
+| Config ba phần (cũ) | `banking` | `public` | `debezium_signal` | `banking.public.debezium_signal` ❌ |
+| Config hai phần (mới) | `public` | `null` | `debezium_signal` | `public.debezium_signal` ✅ |
+
+Hai phần khớp nhờ đúng cái quy tắc bỏ-null đó: `catalog='public' + schema=null` cho ra cùng
+một chuỗi với `catalog=null + schema='public'`. Trông như ăn may, nhưng đó là hành vi cố ý
+của `TableId` và là lý do tài liệu Debezium ghi định dạng Postgres là `<schema>.<table>`.
+
+### Vì sao mất 4 ngày mới tìm ra
+
+**Không có một dòng log lỗi nào.** Chuỗi sai vẫn trỏ đúng bảng khi Debezium *ghi*, chỉ hỏng
+khi Debezium *nhận diện*. Nên mọi bước đều "thành công":
+
+1. Signal nhận được → log `Requested 'INCREMENTAL' snapshot of '[public.merchants]'` ✅
+2. Watermark open ghi vào bảng ✅ (câu INSERT dựng thẳng từ chuỗi config → vẫn đúng bảng)
+3. Chunk query **chạy và đọc trọn 50 dòng** vào buffer ✅
+   `SELECT * FROM "public"."merchants" ORDER BY "merchant_id" LIMIT 1024`
+4. Watermark close ghi vào bảng ✅
+5. Dòng close quay lại qua WAL, qua EventDispatcher, **ra tới Kafka** ✅
+6. …nhưng `isSignalDataCollection()` trả `false` → `closeWindow()` **không chạy** →
+   `sendWindowEvents()` không chạy → **50 dòng trong buffer bị vứt im lặng**
+7. `primary_key` đứng ở `null` → không có chunk kế → snapshot treo và **chặn im lặng** mọi
+   yêu cầu sau
+
+Hỏng ở bước 6, mà bước 6 không in gì cả.
+
+### 🔴 Hai kết luận SAI của chính issue này
+
+**1. "Lỗi nằm ở BƯỚC ĐỌC CHUNK — nó trả về RỖNG" (mục 05-08, điểm 3) — SAI.**
+Chunk query chạy hoàn hảo và đọc đủ 50 dòng. Bắt được nguyên văn câu SQL bằng cách bật
+`log_statement='all'` phía Postgres. Suy luận cũ đi từ triệu chứng (`primary_key` không
+nhích) tới nguyên nhân (`chunk rỗng`) mà **không có bằng chứng trực tiếp nào** cho bước
+giữa — và bước giữa chính là chỗ sai.
+
+**2. "Cửa sổ watermark MỞ VÀ ĐÓNG BÌNH THƯỜNG — lỗi không nằm ở đó" (mục 05-08, điểm 2) — SAI MỘT NỬA.**
+*Ghi* watermark hoạt động. *Đọc lại* watermark thì không. Việc thấy đủ cặp open/close trong
+bảng và thấy chúng có mặt trong topic đã bị hiểu nhầm thành "phần này ổn", nên vùng nghi ngờ
+bị thu hẹp **sai hướng** và loại bỏ đúng chỗ đang hỏng.
+
+Cả hai sai lầm cùng một dạng: **suy ra một bước từ kết quả của bước khác.** Chỉ có `log_statement='all'`
+mới cắt được vòng luẩn quẩn đó, vì nó cho thấy DB *thật sự* nhận câu gì — độc lập hoàn toàn
+với việc Debezium tự thuật lại nó đang làm gì.
+
+### Bằng chứng đóng issue
+
+Đúng điều kiện đã đặt ra: `op='r'` về tới Bronze, đối soát lệch 0.
+
+```
+topic gtl.public.merchants   50 -> 150 (xả 2 yêu cầu tồn đọng khi task khởi động lại)
+                            150 -> 200 (signal mới sau khi dọn state)
+message cuối mang cờ snapshot = "incremental"
+offset sau khi xong          : SẠCH — snapshot tự kết thúc và tự dọn state
+
+bronze.merchants   200 dòng /  50 khoá   <- 4 bản mỗi merchant, ĐÚNG như thiết kế
+silver.merchants    50 dòng /  50 khoá   <- khử trùng theo _kafka_offset
+
+dbt build                    : 91 PASS / 0 ERROR / 0 WARN (84s)
+audit_reconciliation 13:11:49: 2.692.703 giao dịch · $11.207.350.475,15 · lệch $0,00
+```
+
+### Điều này thay đổi gì về mặt vận hành
+
+Lớp bảo vệ số 2 của CDC risk #1 **giờ thật sự dùng được**, không còn nằm trên giấy:
+slot bị invalidate → `bash scripts/cdc_resnapshot.sh public.merchants` → dữ liệu quay lại,
+không restart connector, không mất vị trí WAL, không dừng streaming.
+
+Giới hạn ở mục "Giới hạn cần ghi nhớ" phía trên **vẫn nguyên giá trị**: đây khôi phục
+*trạng thái hiện tại*, không khôi phục *lịch sử thay đổi*. Và với bảng fact cỡ thật thì
+snapshot toàn bộ vẫn là sai — đúng phương án là backfill theo cửa sổ bằng
+`additional-condition` của signal.
+
+### Bài học
+
+1. **Định dạng tên bảng trong config Debezium khác nhau theo từng connector.** Postgres là
+   `<schema>.<table>`; MySQL là `<database>.<table>`; SQL Server là ba phần. Chép nhầm quy
+   ước từ connector khác không gây lỗi cấu hình — nó gây **hỏng im lặng**.
+2. **Một chuỗi cấu hình có thể vừa đúng vừa sai cùng lúc.** Chuỗi này đúng khi dùng để
+   *dựng câu SQL*, sai khi dùng để *so khớp*. Không có kiểm tra khởi động nào bắt được, vì
+   xét riêng từng cách dùng thì đều hợp lệ.
+3. **Khi mọi bước đều báo thành công mà kết quả không có, hãy đo từ phía KHÁC.**
+   `log_statement='all'` ở Postgres phá được thế bí sau nhiều ngày, đơn giản vì nó không
+   phụ thuộc vào lời tự thuật của Debezium.
