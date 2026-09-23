@@ -20,6 +20,12 @@ select
     {{ mask_email(cdc_field('email')) }}                   as email_masked,
     {{ generalize_birth_year(cdc_field('date_of_birth')) }} as birth_year,
     {{ cdc_field('account_type') }}                        as account_type,
+    -- Persona: archetype HÀNH VI (không phải PII). Đây là thứ làm cho
+    -- "số tài khoản hoạt động" trở thành con số biết di chuyển.
+    {{ cdc_field('persona') }}                             as persona,
+    -- Vùng cư trú — độ phân giải VÙNG, không phải địa chỉ, nên không cần mask.
+    -- Khác vùng của merchant = giao dịch ngoài vùng, một tín hiệu gian lận.
+    {{ cdc_field('home_region') }}                         as home_region,
     cast({{ cdc_field('balance') }} as decimal(15,2))      as balance,
     cast({{ cdc_field('created_at') }} as timestamp)       as created_at,
     {{ cdc_meta_columns() }}

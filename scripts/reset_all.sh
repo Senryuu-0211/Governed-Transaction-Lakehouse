@@ -38,7 +38,9 @@ echo " RESET TOÀN BỘ — CÁC THỨ SAU SẼ BỊ XOÁ VĨNH VIỄN"
 echo "=============================================================="
 echo "  1. Postgres  : toàn bộ accounts / merchants / transactions"
 echo "  2. Kafka     : toàn bộ topic + offset + replication slot state"
-echo "  3. AWS S3    : toàn bộ prefix warehouse/ trên bucket THẬT (Bronze/Silver/Gold)"
+echo "  3. Object store: toàn bộ prefix warehouse/ (Bronze/Silver/Gold)"
+echo "                 -> bucket nào là do S3_ENDPOINT trong .env quyết định:"
+echo "                    có giá trị = MinIO cục bộ · để trống = AWS S3 THẬT"
 echo "  4. Host      : $PROJECT_ROOT/iceberg-catalog/  (catalog sqlite)"
 echo "                 $PROJECT_ROOT/_checkpoints/      (offset của Spark)"
 echo
@@ -82,7 +84,7 @@ echo "      xong"
 # 28-07: storage chuyển sang S3 THẬT -> `down -v` KHÔNG còn xoá data lakehouse
 # (trước đây nó xoá volume MinIO). Phải dọn tường minh, nếu không data cũ ở lại
 # S3: sai trạng thái sau reset VÀ tính tiền mãi.
-echo "[2b/5] xoá prefix warehouse/ trên S3..."
+echo "[2b/5] xoá prefix warehouse/ trên object store..."
 "${VENV_PYTHON:-$HOME/working/gtl-spark-venv/bin/python}" \
     "$PROJECT_ROOT/scripts/s3_admin.py" purge || echo "      ⚠️ không dọn được S3 (kiểm .env/IAM)"
 
@@ -95,7 +97,9 @@ echo "      xong"
 
 # --- Bước 4: dựng lại --------------------------------------------------------
 echo "[4/5] dựng lại stack (init script chạy lại trên volume trống)..."
-docker compose up -d >/dev/null 2>&1
+# --build BẮT BUỘC: faker là image tự build, không có cờ này thì code
+# faker mới sửa KHÔNG vào image và reset dựng lại bằng logic cũ.
+docker compose up -d --build >/dev/null 2>&1
 echo "      đợi Postgres healthy..."
 for _ in $(seq 1 60); do
   status=$(docker inspect -f '{{.State.Health.Status}}' gtl-postgres 2>/dev/null)
@@ -124,6 +128,22 @@ for _ in $(seq 1 40); do
 done
 
 # --- Bước 5: đăng ký lại connector -------------------------------------------
+# ⭐ ĐỢI BACKFILL XONG TRƯỚC KHI ĐĂNG KÝ CONNECTOR (thêm 09-2026).
+# Faker nạp ~9 triệu dòng lịch sử bằng COPY ngay khi container lên. Nếu connector
+# đăng ký lúc đó thì Debezium phải nuốt cả khối qua WAL STREAMING — chậm hơn hẳn
+# snapshot, và slot giữ lại vài GB WAL trong lúc chờ (max_slot_wal_keep_size=10GB).
+# Đợi xong rồi mới đăng ký thì toàn bộ lịch sử vào bằng MỘT snapshot bulk.
+# Nhận biết bằng dòng ">> LIVE:" — faker chỉ in nó SAU khi backfill hoàn tất.
+echo "      đợi faker nạp xong lịch sử (có thể vài phút)..."
+for i in $(seq 1 240); do   # tối đa 20 phút
+  if docker logs gtl-faker 2>&1 | grep -q ">> LIVE:"; then
+    docker logs gtl-faker 2>&1 | grep -E "Backfill xong|Seeded" | sed 's/^/      /'
+    break
+  fi
+  [ $((i % 30)) -eq 0 ] && echo "      ... còn đang nạp ($((i * 5))s)"
+  sleep 5
+done
+
 echo "[5/5] đăng ký lại Debezium connector (Avro)..."
 bash "$PROJECT_ROOT/scripts/register-connector.sh" >/dev/null 2>&1 \
   && echo "      xong" || echo "      ⚠️  đăng ký thất bại, chạy tay: bash scripts/register-connector.sh"

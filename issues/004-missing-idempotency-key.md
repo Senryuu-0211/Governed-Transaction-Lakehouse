@@ -1,6 +1,6 @@
 # Issue #004 — Bảng `transactions` thiếu `idempotency_key`
 
-**Trạng thái:** OPEN
+**Trạng thái:** ✅ **ĐÃ ĐÓNG 22-09-2026** — xem mục cuối file
 **Phát hiện:** Phase 1 Step 1c (2026-07-20), khi rà soát ca hỏng của hệ thống thanh toán
 **Ảnh hưởng:** schema nguồn — cần `down -v` (init script chỉ chạy trên volume trống)
 **Mức:** Medium (thiếu sót về tính thực tế của mô hình, không chặn phase nào)
@@ -55,3 +55,50 @@ xong ở 1c, và Phase 2 sẽ cần một lần reset nữa để Silver có d�
   "cải tiến schema nguồn", nên làm chung một lần.
 - Ca hỏng ở tầng ứng dụng đã được mô phỏng trong faker (giao dịch treo + job quét, 2026-07-20);
   idempotency là mảnh còn thiếu cuối cùng của mô hình đó.
+
+
+---
+
+## ✅ ĐÓNG 22-09
+
+Gộp vào cùng lần reset với issue #002, đúng như mục "Vì sao chưa làm ngay" đã dự tính.
+
+### Schema
+
+```sql
+idempotency_key UUID NOT NULL DEFAULT gen_random_uuid(),
+CONSTRAINT uq_transactions_idempotency UNIQUE (idempotency_key)
+```
+
+`DEFAULT` chỉ để tiện cho INSERT thủ công — faker **luôn truyền khoá tường minh**, vì
+điểm mấu chốt của idempotency là khoá sinh ở phía **CLIENT**, không phải phía server.
+
+### Faker: retry có chủ đích
+
+Cứ 1/300 lần insert, "client" gửi lại đúng khoá cũ. DB từ chối bằng UNIQUE — và đó là
+**HÀNH VI ĐÚNG**, không phải lỗi. Bộ đếm `retry bị chặn` in ra trong log live chính là
+bằng chứng hàng rào chống trừ tiền hai lần đang hoạt động.
+
+### Điều đáng nói nhất: test `unique` ở Silver kiểm cái gì
+
+Nguồn đã UNIQUE nên **không bao giờ** có dòng trùng lọt xuống lakehouse. Vậy test
+`unique` trên `silver.transactions.idempotency_key` để làm gì?
+
+> Nó không kiểm cái CỘT. Nó kiểm **ĐƯỜNG ỐNG**.
+
+Một đảm bảo do Postgres cưỡng chế phải còn nguyên sau khi dữ liệu đi qua **sáu lần biến
+đổi**: logical decoding → Debezium → Avro/Apicurio → Kafka → Spark Structured Streaming →
+Iceberg MERGE. Bất kỳ khâu nào nhân đôi bản ghi — một lần replay, một lần MERGE sai khoá,
+một lần Bronze đọc trùng offset — thì test này đỏ. Đó là phép thử end-to-end rẻ nhất mà
+project có.
+
+Đúng tinh thần đã ghi trong chính issue này: *"UNIQUE trên nguồn cho phép dbt kiểm tra
+ràng buộc đó vẫn đúng sau khi qua toàn bộ pipeline."*
+
+### Bằng chứng (22-09)
+
+```
+unique_transactions_idempotency_key    PASS   trên 8.273.288 dòng
+not_null_transactions_idempotency_key  PASS
+dbt build --full-refresh               113 PASS / 0 ERROR
+```

@@ -19,6 +19,8 @@ select
         else '65+'
     end                                        as age_band,
     account_type,
+    persona,
+    home_region,
     balance,
     created_at                                 as opened_at
 from {{ ref('accounts') }}

@@ -75,15 +75,24 @@ services:
       PGUSER: ${POSTGRES_USER}
       PGPASSWORD: ${POSTGRES_PASSWORD}
       PGDATABASE: ${POSTGRES_DB}
-      TXN_RATE: ${TXN_RATE}       # INSERT/giây mục tiêu (từ .env)
+      TXN_RATE: ${TXN_RATE}       # INSERT/giây mục tiêu — PHẢI khớp mật độ backfill
       RANDOM_SEED: ${RANDOM_SEED} # seed để data tái lập được (reconciliation test)
+      # Lịch sử nạp MỘT LẦN lúc seed (volume trống). Không có nó thì mart chỉ có
+      # vài dòng và không có kỳ nào để so sánh với kỳ nào.
+      BACKFILL_DAYS: ${BACKFILL_DAYS}
+      BACKFILL_TXN_PER_DAY: ${BACKFILL_TXN_PER_DAY}
+      N_ACCOUNTS: ${N_ACCOUNTS}
+      N_MERCHANTS: ${N_MERCHANTS}
     depends_on:
       postgres:
         condition: service_healthy   # đợi Postgres healthy mới bơm
     deploy:
       resources:
         limits:
-          memory: 256M
+          # 512M chứ không 256M: backfill rút một lô 100.000 chỉ số mỗi ngày mô
+          # phỏng. Vẫn thừa, nhưng OOM giữa chừng một lượt backfill 8 phút thì
+          # tốn hơn nhiều so với 256MB RAM.
+          memory: 512M
     restart: unless-stopped
 
   # ---- Kafka KRaft (single broker, KHÔNG ZooKeeper) --------------------------

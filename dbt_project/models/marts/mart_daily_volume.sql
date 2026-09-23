@@ -15,7 +15,20 @@ select
     sum(case when f.status = 'REVERSED'  then 1 else 0 end) as reversed_count,
     sum(case when f.status = 'PENDING'   then 1 else 0 end) as pending_count,
     sum(f.net_amount)                                       as net_amount,
+    -- Doanh số THẬT: loại chuyển khoản nội bộ (tiền chỉ đổi chỗ,
+    -- không vào/ra khỏi ngân hàng). net_amount ở trên đo LƯU LƯỢNG.
+    sum(f.external_amount)                                       as external_amount,
     avg(case when f.is_real_money then f.amount end)        as avg_completed_amount,
+    -- SỐ KHÁCH HOẠT ĐỘNG — chỉ sống được ở grain NGÀY.
+    -- Đếm-phân-biệt KHÔNG cộng được: số khách hoạt động ở Metro North cộng với
+    -- Coastal East KHÔNG ra số khách thật, vì một người tiêu ở cả hai nơi bị đếm
+    -- hai lần. Vì vậy cột này cố tình VẮNG MẶT ở khối rộng mart_txn_daily — ở đó
+    -- agent được tự do gộp nhóm, và một cột cộng-lại-sai sẽ âm thầm sinh ra số sai.
+    -- Đặt ở đây thì nó đúng, vì grain ngày là grain duy nhất không ai gộp thêm.
+    -- Cần cho phép PHÂN RÃ: giao dịch = khách hoạt động × giao dịch/khách × giá trị/giao dịch.
+    count(distinct f.account_id)                            as active_accounts,
+    -- Offset Kafka lớn nhất đã góp vào dòng này — mọi số đều truy nguồn được.
+    max(f._kafka_offset)                                    as _kafka_offset_max,
     current_timestamp()                                     as _refreshed_at
 from {{ ref('fact_transactions') }} f
 join {{ ref('dim_date') }} d using (date_key)

@@ -25,21 +25,41 @@ models:
           - not_null
           - relationships: { to: ref('dim_account'), field: account_id }
       - name: merchant_id
-        description: The merchant on the other side of the transaction.
+        description: >
+          The merchant on the other side of the transaction. NULL for internal transfers
+          and payroll, which have no merchant. No not_null test on purpose: presence
+          depends on the transaction TYPE, which a blanket not_null cannot express —
+          tests/assert_transfer_rules.sql enforces the rule in both directions.
         data_tests:
-          - not_null
           - relationships: { to: ref('dim_merchant'), field: merchant_id }
+      - name: counterparty_account_id
+        description: >
+          For a transfer, the account the money went TO. Empty for a payment to a merchant.
+          Lets a transfer be followed from both ends without leaving this table.
+        data_tests:
+          - relationships: { to: ref('dim_account'), field: account_id }
       - name: date_key
         description: Calendar day the transaction was created, as YYYYMMDD (join to dim_date).
         data_tests:
           - not_null
           - relationships: { to: ref('dim_date'), field: date_key }
+      - name: is_flagged
+        description: >
+          The bank's system SUSPECTED this transaction. Deliberately imperfect: it
+          misses some real fraud and raises some false alarms — which is the only
+          reason "how good is our detection" is a question worth asking.
+        data_tests: [not_null]
+      - name: fraud_label
+        description: >
+          Whether it ACTUALLY was fraud. Only knowable because this is simulated data;
+          it is the answer key used to measure detection, never an input to it.
+        data_tests: [not_null]
       - name: channel
         description: Where the customer initiated it — ATM, card terminal (POS), web, app, or branch counter.
         data_tests:
           - relationships: { to: ref('dim_channel'), field: channel }
       - name: txn_type
-        description: "Direction of money for the account: CREDIT = money in, DEBIT/TRANSFER = money out."
+        description: "Direction of money for the account: CREDIT/SALARY = money in, DEBIT/TRANSFER = money out."
       - name: status
         description: >
           Where the transaction is in its life: PENDING = accepted, outcome not yet
@@ -57,6 +77,17 @@ models:
           The amount that actually counts: equals amount for COMPLETED, zero for
           everything else. Guaranteed by an automated test — REVERSED can never be
           double-counted.
+        data_tests: [not_null]
+      - name: is_internal_transfer
+        description: >
+          TRUE when the money only moved between two accounts inside this bank. Nothing
+          entered or left the bank, so it is NOT revenue — see external_amount.
+      - name: external_amount
+        description: >
+          The revenue figure. Equals amount only when the transaction COMPLETED and was
+          not an internal transfer; zero otherwise. Use this for any revenue or sales
+          question; net_amount measures throughput and still includes transfers, so
+          summing it overstates business volume.
         data_tests: [not_null]
       - name: created_at
         description: When the customer made the transaction.
@@ -97,6 +128,21 @@ models:
         description: Approximate age in years, derived from birth_year.
       - name: age_band
         description: "Age group for reporting: 18-24, 25-34, 35-49, 50-64, 65+."
+      - name: persona
+        description: >
+          Behavioural archetype, not a size label: it decides how often the customer
+          transacts, how large the amounts are, and which channels they use. DORMANT
+          customers barely transact at all, which is what makes "active customers"
+          a number that can actually move.
+        data_tests:
+          - not_null
+          - accepted_values: { values: ['SALARIED', 'DIGITAL_NATIVE', 'TRADITIONAL', 'CORPORATE', 'DORMANT'] }
+      - name: home_region
+        description: >
+          Region the customer lives in (region-level, no address). Differs from the merchant region on out-of-area spending.
+        data_tests:
+          - not_null
+          - accepted_values: { values: ['Metro North', 'Metro South', 'Central', 'Coastal East', 'Coastal West', 'Highlands'] }
       - name: account_type
         description: "Product type: SAVINGS, CHECKING or CREDIT."
       - name: balance
@@ -160,6 +206,12 @@ models:
         description: Merchant trading name.
       - name: category
         description: "Spend category (Grocery, Fuel, Dining, Retail, Utilities, Travel, Health) — the axis for \"where do customers spend\" questions."
+      - name: region
+        description: >
+          Region the merchant trades in — the natural grouping for any geographic view.
+        data_tests:
+          - not_null
+          - accepted_values: { values: ['Metro North', 'Metro South', 'Central', 'Coastal East', 'Coastal West', 'Highlands'] }
       - name: city
         description: City where the merchant operates.
       - name: registered_at

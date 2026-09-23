@@ -14,6 +14,9 @@ select
     cast({{ cdc_field('merchant_id') }} as bigint)   as merchant_id,
     {{ cdc_field('merchant_name') }}                 as merchant_name,
     {{ cdc_field('category') }}                      as category,
+    -- Vùng gộp được, thành phố thì không: thành phố là chi tiết, vùng là chiều
+    -- cắt mà dashboard thật sự dùng.
+    {{ cdc_field('region') }}                        as region,
     {{ cdc_field('city') }}                          as city,
     cast({{ cdc_field('created_at') }} as timestamp) as created_at,
     {{ cdc_meta_columns() }}

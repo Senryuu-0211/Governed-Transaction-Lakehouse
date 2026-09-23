@@ -1,4 +1,21 @@
-{{ config(severity='warn', warn_if='>0', error_if='>1') }}
+{{ config(severity='error', warn_if='>0', error_if='>1') }}
+
+{#
+  ⚠️ severity PHẢI là 'error' để hai mức hoạt động — bản cũ để 'warn' và điều đó
+  biến `error_if` thành CODE CHẾT suốt từ Phase 4. dbt xử lý thế này:
+
+      if severity == "ERROR" and result.should_error:   status = Fail
+      elif result.should_warn:                          status = Warn
+
+  Với severity='warn' thì nhánh đầu KHÔNG BAO GIỜ được vào, nên test chỉ cảnh báo
+  dù `should_error` đã đúng. Bằng chứng trong log 22-09: test trả 2 dòng (tức
+  2 > 1 = should_error true) mà dbt vẫn in "configured to warn if >0".
+
+  Hệ quả: cổng chặn `push_marts` mà tài liệu mô tả CHƯA TỪNG chặn lần nào —
+  đúng loại hỏng tệ nhất: cổng trông như đang gác, thật ra cửa vẫn mở.
+
+  Giờ: 1 dòng -> WARN (1 > 1 sai)  ·  2 dòng -> ERROR (2 > 1 đúng).
+#}
 
 -- ANOMALY #2 — DỊCH CHUYỂN PHÂN PHỐI SỐ TIỀN, hai mức độ.
 --
@@ -21,7 +38,11 @@ with daily as (
 ),
 
 latest as (
-    select max(full_date) as d from daily
+    -- LOẠI ngày hôm nay: nó LUÔN dở dang (mới chạy được vài giờ), nên đem so với
+    -- các ngày đủ 24h thì lúc nào cũng "sụt". Đo thật 22-09: hôm nay 1.395 giao
+    -- dịch vs ~100.000 của ngày thường -> test bắn vĩnh viễn, và một cảnh báo kêu
+    -- oan thì tệ hơn không có cảnh báo. Chỉ chấm điểm ngày ĐÃ ĐÓNG SỔ.
+    select max(full_date) as d from daily where full_date < current_date()
 ),
 
 hist as (

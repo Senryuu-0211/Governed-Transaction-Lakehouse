@@ -40,10 +40,30 @@ models:
           Still awaiting outcome at build time. A persistently high number signals
           stuck in-doubt transactions needing ops attention.
       - name: net_amount
-        description: "THE daily revenue-volume number: sum of real money only."
+        description: >
+          Money that moved that day — throughput. Includes transfers between two
+          accounts inside the bank, so it is NOT the revenue figure.
+        data_tests: [not_null]
+      - name: external_amount
+        description: >
+          THE daily revenue number: money that actually entered or left the bank.
+          Internal transfers are excluded because nothing was earned when a customer
+          moves money between their own accounts.
         data_tests: [not_null]
       - name: avg_completed_amount
         description: Average face value of completed transactions.
+      - name: active_accounts
+        description: >
+          Distinct accounts that transacted that day. NON-ADDITIVE on purpose, which is
+          why it lives only at day grain: distinct counts cannot be summed across slices
+          (a customer active in two regions would be counted twice). Needed to decompose
+          volume into accounts x transactions-per-account x value-per-transaction.
+        data_tests: [not_null]
+      - name: _kafka_offset_max
+        description: >
+          Highest Kafka offset that fed this row. THE traceability field: every number
+          can be tied back to the exact events behind it, and max-of-max stays correct
+          when the row is rolled up further. _refreshed_at only says when the job ran.
       - name: _refreshed_at
         description: When the pipeline computed this row — shown on dashboards as data freshness.
         data_tests: [not_null]
@@ -62,12 +82,23 @@ models:
       - name: txn_count
         description: Transactions created that day on this channel.
       - name: net_amount
-        description: Real money moved that day through this channel.
+        description: Money that moved that day through this channel (throughput, transfers included).
+      - name: external_amount
+        description: Revenue through this channel — internal transfers excluded.
+      - name: _kafka_offset_max
+        description: >
+          Highest Kafka offset that fed this row. THE traceability field: every number
+          can be tied back to the exact events behind it, and max-of-max stays correct
+          when the row is rolled up further. _refreshed_at only says when the job ran.
       - name: _refreshed_at
         description: Pipeline compute time (freshness stamp).
 
   - name: mart_category_daily
-    description: Daily spend by merchant category — "where are customers spending".
+    description: >
+      Daily spend by merchant category — "where are customers spending". EXCLUDES internal
+      transfers: the source attaches a merchant to every transaction including transfers,
+      so without that filter each category was inflated by roughly 15% with transactions
+      that never happened there.
     columns:
       - name: full_date
         description: Calendar day.
@@ -78,9 +109,190 @@ models:
       - name: txn_count
         description: Transactions created that day in this category.
       - name: net_amount
-        description: Real money moved that day in this category.
+        description: Money that moved that day in this category (throughput, transfers included).
+      - name: external_amount
+        description: Revenue in this category — internal transfers excluded.
+      - name: _kafka_offset_max
+        description: >
+          Highest Kafka offset that fed this row. THE traceability field: every number
+          can be tied back to the exact events behind it, and max-of-max stays correct
+          when the row is rolled up further. _refreshed_at only says when the job ran.
       - name: _refreshed_at
         description: Pipeline compute time (freshness stamp).
+
+  - name: mart_txn_daily
+    description: >
+      THE WIDE CUBE — one row per day x region x category x channel x persona x status.
+      This is the table the question-answering agent queries most. Every measure here is
+      ADDITIVE, which is what makes the cube safe: group by any subset of the dimensions,
+      sum the measures, and the answer is still correct. Ratios, averages and distinct
+      counts are deliberately absent because they do not survive that operation; compute
+      them in the semantic layer as SUM/SUM. Internal transfers carry the reserved label
+      INTERNAL_TRANSFER for both region and category, because a transfer between two
+      accounts has no merchant and therefore belongs to no spend category. Salary credits
+      carry the reserved label PAYROLL for the same reason.
+    columns:
+      - name: full_date
+        description: Calendar day.
+        data_tests: [not_null]
+      - name: day_name
+        description: Weekday spelled out — kept here so seasonality questions need no join.
+      - name: is_weekend
+        description: TRUE Sat/Sun.
+      - name: region
+        description: >
+          Region of the merchant where the money was spent. Two reserved labels:
+          INTERNAL_TRANSFER for transfers between two accounts inside the bank, and
+          PAYROLL for salary credits. Neither has a merchant, so neither has a region.
+        data_tests: [not_null]
+      - name: category
+        description: >
+          Merchant spend category. Reserved labels: INTERNAL_TRANSFER (transfers) and
+          PAYROLL (salary credits) — neither belongs to any spend category. UNKNOWN keeps
+          exactly one meaning: the merchant was deleted at source, but its transactions
+          are still counted. Folding those three cases into one label would silently
+          destroy the ability to answer, without raising any error.
+        data_tests: [not_null]
+      - name: channel
+        description: Channel code (ATM, POS, ONLINE, MOBILE, BRANCH).
+        data_tests: [not_null]
+      - name: persona
+        description: >
+          Behavioural segment of the paying account (SALARIED, DIGITAL_NATIVE, TRADITIONAL,
+          CORPORATE, DORMANT). UNKNOWN means the account was deleted at source.
+        data_tests: [not_null]
+      - name: status
+        description: >
+          Transaction outcome (PENDING, COMPLETED, FAILED, REVERSED). Modelled as a
+          DIMENSION rather than a set of count columns, so "average completed value" is
+          just a filter plus net_amount/txn_count.
+        data_tests: [not_null]
+      - name: txn_count
+        description: Transactions in this cell, whatever the outcome.
+        data_tests: [not_null]
+      - name: net_amount
+        description: >
+          Money that moved — throughput. Includes transfers between accounts inside the
+          bank, so this is NOT the revenue figure.
+        data_tests: [not_null]
+      - name: external_amount
+        description: >
+          THE revenue number: money that actually entered or left the bank. Internal
+          transfers are excluded because nothing is earned when money only changes seats.
+        data_tests: [not_null]
+      - name: fraud_count
+        description: Transactions that were genuinely fraudulent (ground truth).
+      - name: flagged_count
+        description: Transactions the detection system stopped, right or wrong.
+      - name: fraud_caught_count
+        description: >
+          Fraudulent AND flagged — true positives. With the two columns above this is
+          enough to rebuild the whole confusion matrix at any slice, additively.
+      - name: fraud_amount
+        description: >
+          Money moved by genuinely fraudulent transactions. Not derivable from fraud_count:
+          card-testing runs are many tiny amounts, so counting cases without measuring money
+          tells half the story.
+      - name: _kafka_offset_max
+        description: >
+          Highest Kafka offset that fed this row. THE traceability field: every number can
+          be tied back to the exact events behind it, and max-of-max stays correct when the
+          row is rolled up further.
+      - name: _refreshed_at
+        description: Pipeline compute time (freshness stamp).
+        data_tests: [not_null]
+
+  - name: mart_merchant_daily
+    description: >
+      Daily activity per merchant — "where is money concentrating, and which partner just
+      went dark". The only grain that answers questions about a named counterparty, which
+      is why merchant is NOT a dimension of the wide cube: 200 merchants would multiply it
+      200-fold. Internal transfers are excluded, since they belong to no merchant.
+    columns:
+      - name: full_date
+        description: Calendar day.
+        data_tests: [not_null]
+      - name: merchant_id
+        description: Merchant surrogate key.
+        data_tests: [not_null]
+      - name: merchant_name
+        description: >
+          Merchant trading name, denormalised on purpose — an answer that says
+          "Merchant 47" is useless to a non-technical reader.
+      - name: category
+        description: Merchant spend category.
+      - name: region
+        description: Merchant region.
+      - name: city
+        description: Merchant city.
+      - name: txn_count
+        description: Transactions at this merchant that day, whatever the outcome.
+        data_tests: [not_null]
+      - name: completed_count
+        description: Transactions where money actually moved.
+      - name: failed_count
+        description: >
+          Rejected transactions. Stored as a count, not a failure rate, so that rates over
+          multi-day windows are computed as SUM/SUM rather than an average of daily rates.
+      - name: net_amount
+        description: Money that moved at this merchant (throughput).
+      - name: external_amount
+        description: Revenue attributable to this merchant.
+      - name: _kafka_offset_max
+        description: >
+          Highest Kafka offset that fed this row. THE traceability field: every number can
+          be tied back to the exact events behind it, and max-of-max stays correct when the
+          row is rolled up further.
+      - name: _refreshed_at
+        description: Pipeline compute time (freshness stamp).
+        data_tests: [not_null]
+
+  - name: mart_fraud_daily
+    description: >
+      Fraud DETECTION effectiveness by day and channel, stored as the four cells of a
+      confusion matrix. Counts only, never ratios: a month's recall is not the average of
+      its daily recalls, because a day with 3 fraud cases and a day with 130 must not carry
+      equal weight. The semantic layer divides SUM by SUM. Derived from mart_txn_daily
+      rather than recomputed from the fact table, so the two can never disagree — which is
+      only sound because every cube measure is additive.
+    columns:
+      - name: full_date
+        description: Calendar day.
+        data_tests: [not_null]
+      - name: day_name
+        description: Weekday spelled out.
+      - name: is_weekend
+        description: TRUE Sat/Sun.
+      - name: channel
+        description: Channel code.
+        data_tests: [not_null]
+      - name: txn_count
+        description: All transactions on this day and channel.
+        data_tests: [not_null]
+      - name: fraud_count
+        description: Genuinely fraudulent transactions (ground truth).
+      - name: flagged_count
+        description: Transactions the detection system stopped.
+      - name: fraud_amount
+        description: Money moved by genuinely fraudulent transactions.
+      - name: true_positive
+        description: Fraud that was caught.
+      - name: false_positive
+        description: >
+          Honest customers stopped by mistake. A real cost, not zero — this is the column
+          that keeps "flag everything" from looking like a good strategy.
+      - name: false_negative
+        description: Fraud that got through. The expensive cell — the money has left.
+      - name: true_negative
+        description: Honest transactions that passed cleanly. Needed for the false-positive rate.
+      - name: _kafka_offset_max
+        description: >
+          Highest Kafka offset that fed this row. THE traceability field: every number can
+          be tied back to the exact events behind it, and max-of-max stays correct when the
+          row is rolled up further.
+      - name: _refreshed_at
+        description: Pipeline compute time (freshness stamp).
+        data_tests: [not_null]
 
 exposures:
   - name: transaction_overview_dashboard

@@ -27,12 +27,33 @@ models:
               to: ref('accounts')
               field: account_id
       - name: merchant_id
-        description: Merchant involved (FK to silver.merchants).
+        description: >
+          Merchant involved (FK to silver.merchants). NULL for TRANSFER and SALARY,
+          which belong to no merchant. There is deliberately NO not_null test here:
+          "must be present" is not a property of the column, it is a property of the
+          transaction TYPE, and a blanket not_null cannot express that. The real rule
+          is enforced both ways in tests/assert_transfer_rules.sql — purchases must
+          have a merchant, transfers and payroll must not.
         data_tests:
-          - not_null
           - relationships:
               to: ref('merchants')
               field: merchant_id
+      - name: counterparty_account_id
+        description: >
+          For a TRANSFER, the account the money lands in. NULL for merchant payments.
+          Without it a transfer looked like money leaving the bank and never arriving,
+          which quietly broke the "money in = money out" claim the whole platform rests on.
+        data_tests:
+          - relationships:
+              to: ref('accounts')
+              field: account_id
+      - name: idempotency_key
+        description: >
+          Client-generated key that stops a retried payment from charging twice. The
+          source enforces UNIQUE, so duplicates can never reach this layer — which is
+          exactly why the test below is worth having: it verifies the guarantee survived
+          CDC, Kafka, Spark, Iceberg and the MERGE, not just that the column exists.
+        data_tests: [unique, not_null]
       - name: amount
         description: >
           Transaction amount as DECIMAL(15,2). Traveled the whole pipeline as a string
@@ -44,9 +65,13 @@ models:
         data_tests:
           - accepted_values: { values: ["USD"] }
       - name: txn_type
-        description: "Money direction: CREDIT = in, DEBIT/TRANSFER = out."
+        description: >
+          Money direction: CREDIT/SALARY = in, DEBIT/TRANSFER = out. SALARY is its own
+          type rather than a kind of CREDIT because payroll has no merchant, and every
+          layer downstream needs to recognise that by DECLARATION, not by guessing from
+          channel, day of month and amount.
         data_tests:
-          - accepted_values: { values: ["CREDIT", "DEBIT", "TRANSFER"] }
+          - accepted_values: { values: ["CREDIT", "DEBIT", "TRANSFER", "SALARY"] }
       - name: status
         description: >
           Lifecycle: PENDING (intent recorded, no money moved yet) -> COMPLETED (real
@@ -55,6 +80,17 @@ models:
         data_tests:
           - not_null
           - accepted_values: { values: ["PENDING", "COMPLETED", "FAILED", "REVERSED"] }
+      - name: is_flagged
+        description: >
+          The bank's system SUSPECTED this transaction. Deliberately imperfect: it
+          misses some real fraud and raises some false alarms — which is the only
+          reason "how good is our detection" is a question worth asking.
+        data_tests: [not_null]
+      - name: fraud_label
+        description: >
+          Whether it ACTUALLY was fraud. Only knowable because this is simulated data;
+          it is the answer key used to measure detection, never an input to it.
+        data_tests: [not_null]
       - name: channel
         description: Where the transaction was initiated.
         data_tests:
@@ -109,6 +145,21 @@ models:
           goes empty and every age report quietly stops working (that is exactly what the
           Avro migration caused before this test existed).
         data_tests: [not_null]
+      - name: persona
+        description: >
+          Behavioural archetype, not a size label: it decides how often the customer
+          transacts, how large the amounts are, and which channels they use. DORMANT
+          customers barely transact at all, which is what makes "active customers"
+          a number that can actually move.
+        data_tests:
+          - not_null
+          - accepted_values: { values: ['SALARIED', 'DIGITAL_NATIVE', 'TRADITIONAL', 'CORPORATE', 'DORMANT'] }
+      - name: home_region
+        description: >
+          Region the customer lives in. Region-level only — never a street address — so it needs no masking. A merchant in a different region is a classic fraud signal.
+        data_tests:
+          - not_null
+          - accepted_values: { values: ['Metro North', 'Metro South', 'Central', 'Coastal East', 'Coastal West', 'Highlands'] }
       - name: account_type
         data_tests:
           - accepted_values: { values: ["SAVINGS", "CHECKING", "CREDIT"] }
@@ -146,6 +197,12 @@ models:
         data_tests:
           - accepted_values:
               values: ["Grocery", "Fuel", "Dining", "Retail", "Utilities", "Travel", "Health"]
+      - name: region
+        description: >
+          Region the merchant trades in. Cities are detail; regions are what a dashboard actually groups by.
+        data_tests:
+          - not_null
+          - accepted_values: { values: ['Metro North', 'Metro South', 'Central', 'Coastal East', 'Coastal West', 'Highlands'] }
       - name: city
         description: Merchant city (synthetic).
       - name: created_at

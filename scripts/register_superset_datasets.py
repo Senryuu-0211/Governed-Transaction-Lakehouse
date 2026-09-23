@@ -28,7 +28,17 @@ PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 SUPERSET = "http://localhost:8088"
 DATABASE_NAME = "GTL Marts"
 SCHEMA = "public"          # push_marts.py ghi vào schema public của db `marts`
-DATASETS = ["mart_daily_volume", "mart_channel_daily", "mart_category_daily"]
+DATASETS = [
+    "mart_daily_volume",
+    "mart_channel_daily",
+    "mart_category_daily",
+    # Thêm 23-09 cùng tầng phục vụ cho agent hỏi-đáp. Superset dùng chung
+    # đúng những bảng đó — một tầng phục vụ, không phải hai, nếu không
+    # dashboard và agent sẽ có ngày trả lời hai con số khác nhau.
+    "mart_txn_daily",
+    "mart_merchant_daily",
+    "mart_fraud_daily",
+]
 
 
 def load_env() -> dict:

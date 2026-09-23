@@ -28,19 +28,44 @@
 --   * FAILED/PENDING chưa từng chuyển  -> net 0
 -- => net_amount = amount nếu COMPLETED, ngược lại 0. Mọi tổng doanh số downstream
 --    (mart, dashboard, report) BẮT BUỘC đi qua net_amount, không SUM(amount) thô.
+--
+-- LUẬT TIỀN THẬT #2 — CHUYỂN KHOẢN NỘI BỘ KHÔNG PHẢI DOANH SỐ (issue #002):
+--   Một TRANSFER hoàn tất trừ tiền tài khoản A và cộng vào tài khoản B. Xét trên
+--   toàn ngân hàng, TỔNG TIỀN KHÔNG ĐỔI — không đồng nào vào hay ra khỏi hệ thống.
+--   Cộng nó vào "doanh số" là đếm một khoản tiền chỉ đổi chỗ như thể vừa kiếm được;
+--   với tỷ lệ TRANSFER ~15% thì con số bị thổi lên tương ứng.
+--   Đây là loại sai mà MỌI test từng-dòng đều xanh: mỗi dòng đều hợp lệ, chỉ có
+--   phép CỘNG là sai nghĩa. Cùng họ với lý do phải có bảng đối soát.
+-- => external_amount = tiền THẬT SỰ vào/ra khỏi ngân hàng (loại chuyển khoản nội bộ).
+--    Báo cáo doanh số dùng external_amount; net_amount giữ lại để đo LƯU LƯỢNG.
 
 select
     t.txn_id,
     t.account_id,
     t.merchant_id,
+    -- Tài khoản đích của chuyển khoản (NULL với giao dịch merchant). Giữ ở fact để
+    -- truy được dòng tiền hai đầu mà không phải quay về Silver.
+    t.counterparty_account_id,
     cast(date_format(t.created_at, 'yyyyMMdd') as int)     as date_key,
     t.channel,
     t.txn_type,
+    -- Gian lận đi thẳng xuống fact: mọi câu hỏi về hiệu quả phát hiện đều là
+    -- câu hỏi ở grain giao dịch.
+    t.is_flagged,
+    t.fraud_label,
     t.status,
     t.amount,
     t.status = 'COMPLETED'                                 as is_real_money,
     case when t.status = 'COMPLETED' then t.amount
          else cast(0 as decimal(15,2)) end                 as net_amount,
+    t.txn_type = 'TRANSFER'                                as is_internal_transfer,
+    -- issue #007 — lương là tiền TỪ BÊN NGOÀI vào (nên vẫn tính external_amount),
+    -- nhưng KHÔNG thuộc merchant nào. Cờ này để mart gắn nhãn riêng thay vì để nó
+    -- rơi vào 'UNKNOWN' lẫn với merchant đã bị xoá ở nguồn — hai thứ khác hẳn nhau.
+    t.txn_type = 'SALARY'                                  as is_payroll,
+    -- Doanh số THẬT: loại cả giao dịch chưa thành tiền LẪN tiền chỉ đổi chỗ nội bộ.
+    case when t.status = 'COMPLETED' and t.txn_type <> 'TRANSFER' then t.amount
+         else cast(0 as decimal(15,2)) end                 as external_amount,
     t.created_at,
     t.updated_at,
     -- Cờ soft-delete: giao dịch đã bị purge ở nguồn. Downstream PHẢI lọc.
