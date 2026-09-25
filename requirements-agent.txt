@@ -1,0 +1,35 @@
+# Runtime cho AGENT hỏi-đáp (venv RIÊNG: ~/working/gtl-agent-venv).
+#
+# VÌ SAO VENV RIÊNG, KHÔNG DÙNG CHUNG gtl-spark-venv:
+#   Agent không cần pyspark. Nhét langchain vào cùng venv đang chạy pyspark 3.5.0
+#   + dbt-core 1.12 là tự chuốc xung đột phụ thuộc vào đúng cái venv vận hành
+#   pipeline — hỏng ở đó thì mất cả đường ống, không chỉ mất chatbot.
+#   Tách ra cũng đúng với cách nó được triển khai: agent là một service riêng.
+#
+# GHIM CỨNG phiên bản: hệ sinh thái langchain đổi API rất nhanh, một lần
+# `pip install` không ghim là một sáng hôm sau agent không chạy mà code không đổi.
+#
+# Dựng lại:
+#   python3 -m venv ~/working/gtl-agent-venv
+#   ~/working/gtl-agent-venv/bin/pip install -r requirements-agent.txt
+
+# Đồ thị trạng thái: agent -> tools -> agent -> verify. Chọn LangGraph (không
+# phải vòng lặp tay) vì cần nút verify chạy SAU khi mô hình viết xong câu trả
+# lời, và cần trần số vòng lặp — hai thứ không có trong vòng ReAct dựng sẵn.
+langgraph==1.2.12
+langgraph-checkpoint==4.2.0
+langgraph-prebuilt==1.1.0
+langchain-core==1.6.4
+
+# DeepSeek nói đúng giao thức OpenAI nên dùng chung client: đổi nhà cung cấp chỉ
+# là đổi base_url + tên model, không sửa một dòng code agent nào.
+langchain-openai==1.6.5
+openai==3.19.2
+
+# Đọc marts qua user marts_ro (CHỈ SELECT). Dùng psycopg2 cho khớp phần còn lại
+# của project — mang psycopg3 vào chỉ để có API mới hơn là thêm một thứ phải
+# nâng cấp, đổi lấy gần như không gì.
+psycopg2-binary==2.9.13
+
+# Đọc semantic/metrics.yml.
+PyYAML==6.0.3

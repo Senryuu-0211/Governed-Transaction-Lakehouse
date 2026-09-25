@@ -48,3 +48,7 @@ dbt_project/.user.yml
 
 # Sinh từ spark-defaults.conf.tmpl bởi scripts/dbt.sh (chứa tên bucket S3)
 dbt_project/spark-conf/spark-defaults.conf
+
+# Kết quả eval sinh mới mỗi lần chạy (toàn văn câu trả lời của agent). Eval tái lập
+# được nên không cần giữ; bảng điểm quan trọng được ghi vào docs/worklog.md.
+agent/eval_results/

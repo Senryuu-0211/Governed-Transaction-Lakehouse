@@ -1,0 +1,269 @@
+# =============================================================================
+# TẦNG SEMANTIC — định nghĩa "doanh số nghĩa là gì" ở MỘT chỗ duy nhất.
+#
+# VÌ SAO TỰ VIẾT, KHÔNG DÙNG MetricFlow (chốt 22-09):
+#   MetricFlow KHÔNG hỗ trợ Spark, và nó sinh SQL hộ — trong khi ta cần cắm
+#   watermark Kafka offset vào MỌI truy vấn. Tự viết thì kiểm soát được cả hai.
+#   Đổi sang MetricFlow khi vượt ~15 metric.
+#
+# ⚠️ BA LUẬT CỦA FILE NÀY
+#
+# 1. TỶ LỆ LUÔN LÀ TỔNG CHIA TỔNG, không bao giờ là trung bình của các tỷ lệ.
+#    Vì thế `type: ratio` khai numerator/denominator RỜI NHAU, và bộ dựng SQL
+#    cộng từng vế trước rồi mới chia. Không có cách nào viết một tỷ lệ sai ở đây
+#    mà file vẫn hợp lệ — đó là điểm của việc khai báo thay vì viết SQL tay.
+#
+# 2. `filter` ở đây là của NGƯỜI VIẾT FILE, không phải của người dùng.
+#    Nó được nhúng thẳng vào SQL. Filter đến từ agent/người dùng đi qua tham số
+#    truy vấn (psycopg `%s`), không bao giờ nối chuỗi. Hai đường khác hẳn nhau.
+#
+# 3. Metric chỉ sống ở đúng `source` của nó. `active_accounts` là đếm-phân-biệt
+#    nên CHỈ có ở grain ngày; khai nó trên khối rộng là mở đường cho một con số
+#    sai mà không ai báo lỗi.
+# =============================================================================
+version: 1
+
+sources:
+  txn_daily:
+    table: mart_txn_daily
+    description: >
+      Khối rộng 6 chiều — nguồn mặc định cho mọi câu hỏi về khối lượng, doanh số
+      và gian lận. Mọi đo lường trong đó đều CỘNG ĐƯỢC nên gộp nhóm theo chiều
+      bất kỳ vẫn đúng.
+    date_column: full_date
+    watermark_column: _kafka_offset_max
+    dimensions:
+      full_date:  { label: "Ngày",        type: date }
+      day_name:   { label: "Thứ",         type: text }
+      is_weekend: { label: "Cuối tuần",   type: bool }
+      region:     { label: "Vùng",        type: text }
+      category:   { label: "Ngành hàng",  type: text }
+      channel:    { label: "Kênh",        type: text }
+      persona:    { label: "Nhóm khách",  type: text }
+      status:     { label: "Trạng thái",  type: text }
+
+  daily_volume:
+    table: mart_daily_volume
+    description: >
+      Grain NGÀY. Nơi duy nhất có `active_accounts` — đếm-phân-biệt không cộng
+      được nên không thể đặt ở khối rộng.
+    date_column: full_date
+    watermark_column: _kafka_offset_max
+    dimensions:
+      full_date:  { label: "Ngày",      type: date }
+      day_name:   { label: "Thứ",       type: text }
+      is_weekend: { label: "Cuối tuần", type: bool }
+      month_name: { label: "Tháng",     type: text }
+
+  merchant_daily:
+    table: mart_merchant_daily
+    description: Grain merchant — câu hỏi về một đối tác cụ thể, và "tiền dồn vào đâu".
+    date_column: full_date
+    watermark_column: _kafka_offset_max
+    dimensions:
+      full_date:     { label: "Ngày",        type: date }
+      merchant_id:   { label: "Mã merchant", type: int }
+      merchant_name: { label: "Merchant",    type: text }
+      category:      { label: "Ngành hàng",  type: text }
+      region:        { label: "Vùng",        type: text }
+      city:          { label: "Thành phố",   type: text }
+
+  fraud_daily:
+    table: mart_fraud_daily
+    description: Ma trận nhầm lẫn của bộ phát hiện gian lận, theo ngày và kênh.
+    date_column: full_date
+    watermark_column: _kafka_offset_max
+    dimensions:
+      full_date:  { label: "Ngày",      type: date }
+      day_name:   { label: "Thứ",       type: text }
+      is_weekend: { label: "Cuối tuần", type: bool }
+      channel:    { label: "Kênh",      type: text }
+
+metrics:
+  # ---- Tiền -----------------------------------------------------------------
+  - name: revenue
+    label: "Doanh số"
+    source: txn_daily
+    type: sum
+    expr: external_amount
+    format: money
+    description: >
+      Tiền THỰC SỰ vào hoặc ra khỏi ngân hàng. Đã loại chuyển khoản nội bộ, vì
+      khách chuyển tiền giữa hai tài khoản của chính ngân hàng thì tổng tiền
+      không đổi — cộng vào doanh số là đếm một khoản chỉ đổi chỗ như vừa kiếm
+      được. ĐÂY là con số dùng cho mọi báo cáo doanh thu.
+
+  - name: throughput
+    label: "Lưu lượng tiền"
+    source: txn_daily
+    type: sum
+    expr: net_amount
+    format: money
+    description: >
+      Tổng tiền đã chuyển động, KỂ CẢ chuyển khoản nội bộ. Đo tải của hệ thống,
+      KHÔNG phải doanh thu. Dùng nhầm cái này thay cho `revenue` sẽ thổi phồng
+      con số khoảng 15%.
+
+  - name: txn_count
+    label: "Số giao dịch"
+    source: txn_daily
+    type: sum
+    expr: txn_count
+    format: count
+    description: Mọi giao dịch được tạo, bất kể kết cục.
+
+  - name: avg_txn_value
+    label: "Giá trị trung bình mỗi giao dịch"
+    source: txn_daily
+    type: ratio
+    numerator:   { expr: net_amount, filter: "status = 'COMPLETED'" }
+    denominator: { expr: txn_count,  filter: "status = 'COMPLETED'" }
+    format: money
+    description: >
+      Chỉ tính giao dịch đã hoàn tất — giao dịch hỏng chưa từng chuyển đồng nào
+      nên đưa vào mẫu số là kéo trung bình xuống một cách vô nghĩa. Một trong ba
+      nhân tử của phép phân rã sản lượng.
+
+  # ---- Chất lượng vận hành --------------------------------------------------
+  - name: success_rate
+    label: "Tỷ lệ thành công"
+    source: txn_daily
+    type: ratio
+    numerator:   { expr: txn_count, filter: "status = 'COMPLETED'" }
+    denominator: { expr: txn_count }
+    format: percent
+    description: >
+      Phần giao dịch đi trót lọt. Tụt ở MỘT kênh trong khi các kênh khác bình
+      thường là dấu hiệu sự cố hạ tầng của riêng kênh đó.
+
+  - name: failure_rate
+    label: "Tỷ lệ hỏng"
+    source: txn_daily
+    type: ratio
+    numerator:   { expr: txn_count, filter: "status = 'FAILED'" }
+    denominator: { expr: txn_count }
+    format: percent
+    description: Phần giao dịch bị từ chối. Bù với `success_rate` nhưng không bằng 1 trừ đi nó, vì còn PENDING và REVERSED.
+
+  # ---- Khách hàng (CHỈ grain ngày) ------------------------------------------
+  - name: active_accounts
+    label: "Số khách hoạt động"
+    source: daily_volume
+    type: sum
+    expr: active_accounts
+    format: count
+    description: >
+      Số tài khoản có ít nhất một giao dịch trong ngày. ⚠️ CHỈ đúng ở grain NGÀY:
+      đếm-phân-biệt không cộng được, nên không có ở khối rộng. Một nhân tử của
+      phép phân rã sản lượng.
+
+  - name: daily_txn_count
+    label: "Số giao dịch (grain ngày)"
+    source: daily_volume
+    type: sum
+    expr: txn_count
+    format: count
+    description: >
+      CÙNG MỘT CON SỐ với `txn_count`, chỉ lấy từ bảng grain ngày. Tồn tại vì
+      phép phân rã nhân tử cần cả ba vế trong MỘT truy vấn, mà `active_accounts`
+      chỉ sống ở đây. Câu hỏi thường ngày thì dùng `txn_count` — nó có đủ 6 chiều.
+
+  - name: daily_throughput
+    label: "Lưu lượng tiền (grain ngày)"
+    source: daily_volume
+    type: sum
+    expr: net_amount
+    format: money
+    description: >
+      Như `throughput` nhưng lấy từ bảng grain ngày, để phân rã nhân tử. Lưu ý đây
+      là LƯU LƯỢNG (gồm chuyển khoản nội bộ), không phải doanh số.
+
+  - name: txn_per_account
+    label: "Số giao dịch mỗi khách"
+    source: daily_volume
+    type: ratio
+    numerator:   { expr: txn_count }
+    denominator: { expr: active_accounts }
+    format: decimal
+    description: >
+      Nhân tử thứ hai của phép phân rã: sản lượng = số khách hoạt động ×
+      số giao dịch mỗi khách × giá trị mỗi giao dịch. Ba nhân tử này di chuyển
+      ĐỘC LẬP nhau, nên khi sản lượng đổi thì so ba cái sẽ chỉ ra nguyên nhân.
+
+  # ---- Gian lận -------------------------------------------------------------
+  - name: fraud_recall
+    label: "Tỷ lệ bắt được gian lận"
+    source: fraud_daily
+    type: ratio
+    numerator:   { expr: true_positive }
+    denominator: { expr: "true_positive + false_negative" }
+    format: percent
+    description: >
+      Trong số gian lận THẬT, bao nhiêu phần bị chặn. ⚠️ Recall của một tháng
+      KHÔNG phải trung bình recall các ngày — ngày có 3 vụ và ngày có 130 vụ
+      không được cân bằng nhau. Vì vậy mart lưu số đếm và tỷ lệ tính ở đây.
+
+  - name: fraud_precision
+    label: "Độ chính xác cảnh báo"
+    source: fraud_daily
+    type: ratio
+    numerator:   { expr: true_positive }
+    denominator: { expr: "true_positive + false_positive" }
+    format: percent
+    description: >
+      Trong số bị chặn, bao nhiêu phần đúng là gian lận. Phần còn lại là khách
+      lương thiện bị làm phiền — chi phí có thật. Cột này là thứ ngăn chiến lược
+      "chặn tất" trông như một ý hay.
+
+  - name: fraud_cases
+    label: "Số vụ gian lận"
+    source: fraud_daily
+    type: sum
+    expr: fraud_count
+    format: count
+    description: >
+      Số giao dịch gian lận THẬT (theo nhãn đối chiếu), bất kể có bị chặn hay không.
+      Phải xem CÙNG `fraud_amount`: chiến dịch dò thẻ làm số vụ tăng vọt trong khi
+      tiền gần như không đổi. Chỉ có tiền thì không thấy đợt dò thẻ; chỉ có số vụ
+      thì không biết thiệt hại. Thêm ngày 25-09 — trước đó tầng này THIẾU hẳn chỉ số
+      đếm, nên về cấu trúc agent không thể phát hiện một đợt dò thẻ.
+
+  - name: fraud_amount
+    label: "Tiền gian lận"
+    source: fraud_daily
+    type: sum
+    expr: fraud_amount
+    format: money
+    description: >
+      Tiền đã chuyển đi trong các giao dịch gian lận thật. Không suy ra được từ
+      số vụ: chiến dịch dò thẻ là rất nhiều khoản $1-30, nên số vụ tăng vọt mà
+      tiền gần như không đổi. Đếm vụ mà không đo tiền là mất nửa câu chuyện.
+
+  # ---- Merchant -------------------------------------------------------------
+  - name: merchant_revenue
+    label: "Doanh số theo merchant"
+    source: merchant_daily
+    type: sum
+    expr: external_amount
+    format: money
+    description: Doanh số quy về từng merchant. Không gồm chuyển khoản và lương — hai loại đó không thuộc merchant nào.
+
+  - name: merchant_txn_count
+    label: "Số giao dịch theo merchant"
+    source: merchant_daily
+    type: sum
+    expr: txn_count
+    format: count
+    description: >
+      Số giao dịch tại từng merchant, bất kể kết cục. Đây là tín hiệu đúng cho câu
+      hỏi "merchant có còn hoạt động không" — doanh số bằng 0 có thể chỉ là mọi giao
+      dịch đều hỏng, còn số giao dịch bằng 0 thì merchant thật sự im lặng.
+
+  - name: merchant_failure_rate
+    label: "Tỷ lệ hỏng theo merchant"
+    source: merchant_daily
+    type: ratio
+    numerator:   { expr: failed_count }
+    denominator: { expr: txn_count }
+    format: percent
+    description: Phần giao dịch hỏng tại một merchant. Cao bất thường ở một merchant là vấn đề của riêng họ, không phải của hệ thống.

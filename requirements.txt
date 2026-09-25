@@ -21,3 +21,8 @@ psycopg2-binary==2.9.12
 # không cần Thrift server.
 dbt-core==1.12.0
 dbt-spark==1.11.0
+
+# Đọc semantic/metrics.yml. KHAI TƯỜNG MINH dù dbt-core vốn đã kéo PyYAML về:
+# tầng semantic không có quan hệ gì với dbt, nên phụ thuộc vào việc dbt tình cờ
+# mang nó theo là thứ sẽ gãy im lặng vào ngày nâng cấp dbt.
+PyYAML==6.0.3

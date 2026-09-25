@@ -4,6 +4,161 @@ Nhật ký để resume nhanh sau khi context bị nén. Mới nhất ở trên.
 
 ---
 
+## 25-09-2026 — Bộ eval tự động: 18/18 qua 3 lượt, sau khi nó chấm trượt chính nó 3 lần
+
+`agent/eval.py` chạy agent qua 6 ca, chấm bằng dữ kiện có cấu trúc (KHÔNG dùng LLM làm
+giám khảo — thêm chi phí và thêm một nguồn không tái lập được).
+
+```
+s1_outage   merchant tắt 10–17/07        n1  tuần 08–14/09 vs 01–07/09  (bẫy kỳ lương)
+s2_fraud    dò thẻ 23–27/07              n2  tuần 15–21/09 vs 08–14/09  (bẫy kỳ lương)
+s3_channel  ONLINE hỏng 04–14/08
+s4_decline  CORPORATE giảm từ 19/08
+```
+
+**Đáp án suy ra từ dữ liệu, không gõ tay:** mốc = `min(dim_account.opened_at)` (ngày seed
+thế giới), cửa sổ lấy từ hằng số `faker/world.py`. Reset xong eval tự chỉnh. Đọc qua
+`marts_ro` — cùng ranh giới quyền với agent.
+
+**Ca negative quan trọng hơn ca positive:** agent báo động mọi thứ sẽ qua hết ca positive.
+Chỉ ca "yên tĩnh có bẫy" mới phân biệt được nó với agent thật sự hiểu dữ liệu.
+
+### Tiến trình: 4/6 → 2/6 → 6/6 → 6/6 → 6/6
+
+**Thiết kế ca đã lộ 2 lỗ trước cả khi chạy:**
+1. Không có metric **đếm số vụ gian lận** — chỉ có tiền/recall/precision. Đợt dò thẻ là
+   *số vụ tăng 3 lần, tiền còn giảm*; về cấu trúc agent **không thể** thấy nó. Thêm `fraud_cases`.
+2. `explain_change` / `find_concentration` nhận cả metric **tỷ lệ** — cộng hiệu tỷ lệ các
+   nhóm không ra hiệu tổng, HHI của một tỷ lệ vô nghĩa. Chặn ở cửa, trả hướng dẫn chuyển
+   sang `detect_divergence`.
+
+**Lượt 1 (4/6) — một lỗi thật của agent, và nó đáng sợ:** hỏi "giữa tháng 7 có merchant nào
+ngừng giao dịch", agent so **1–15/07 với 16–31/07**. Sự cố 10–17/07 **vắt ngang điểm chia**:
+6 ngày tắt vào kỳ đầu, 2 ngày vào kỳ sau → merchant tắt hẳn 8 ngày bị báo **TĂNG
++33.005.420**. Không phải bỏ sót — báo NGƯỢC. Mọi tool so kỳ đều gộp theo kỳ nên mù với loại
+này. → Tool mới **`find_dropouts`** (phát hiện mất tín hiệu — kỹ thuật giám sát chuẩn):
+nhìn chuỗi ngày liền mạch, không có ranh giới nào để cắt ngang. Trên dữ liệu thật: **đúng 1
+khoảng im lặng trên 199 merchant cả tháng 7**, đúng merchant, đúng 10–17/07.
+
+Unit test của `find_dropouts` bắt được một lỗi **vòng tròn** trong chốt chặn thưa thớt:
+đo tỷ lệ im lặng trên phần NGOÀI mọi khoảng — nên thực thể im lặng 2/3 số ngày theo từng đợt
+đúng 2 ngày có mọi số 0 bị hút vào khoảng, phần còn lại toàn ngày hoạt động, tỷ lệ ra 0% →
+6 sự cố giả. Sửa: đo **riêng cho từng khoảng** ("bỏ khoảng này ra, nó có hay im lặng không?").
+
+**Lượt 2 (2/6) — cả 4 ca hỏng đều là lỗi của BỘ CHẤM:**
+
+| "Lỗi" | Thật ra |
+|---|---|
+| s1 lệch khoảng ngày | bộ đọc ngày không hiểu `10/07/2026` — câu trả lời đúng từng ngày |
+| s4 `8` | "−8 USD" cho −7,6: làm tròn HỢP LỆ |
+| s4 `3` | "cảnh báo thứ 3" |
+| n1, n2 `5` | "quét 5 kênh" — agent tự đếm dòng |
+
+Chỗ `8` chạm lại đúng mâu thuẫn cũ: tỷ lệ cần sai số CHẶT (ngưỡng 0,5 từng để mọi tỷ lệ bịa
+lọt), số nguyên làm tròn cần sai số RỘNG. **Một ngưỡng cố định không thoả được cả hai.**
+Cách đúng: **sai số suy ra từ độ chính xác mô hình tự viết** — viết "8" là tự nhận ±0,5,
+viết "0,42" là tự nhận ±0,005, và phóng theo hệ số khi đổi đơn vị ("13,4 tỷ" = ±50 triệu).
+
+Hai chỗ còn lại sửa bằng cùng một nguyên tắc: **để CODE tính con số mô hình sẽ muốn trích**
+(`own_pct_change`, `groups_compared`) thay vì nới bộ kiểm cho mô hình tự tính. "LLM sinh
+truy vấn, không sinh con số" — càng nhiều số do code tính, càng ít số mô hình phải bịa.
+
+### Một cải thiện chất lượng, không phải sửa lỗi
+
+s4 trước đây trả lời đúng CORPORATE nhưng kết thúc bằng *"tôi chưa kết luận được"* — vì luật
+7 cấm lập luận vượt cảnh báo chu kỳ tháng. Giờ `detect_divergence` nói cả chiều NGƯỢC LẠI:
+khi một nhóm QUA kiểm định giả dược, tool ghi rõ *"cùng kỳ tháng trước chỉ đổi −3.390, nay
+−11.562 — chu kỳ tháng KHÔNG giải thích được"*. Agent kết luận chắc chắn **với căn cứ từ
+tool**. Câu trả lời đúng mà không dám nói là câu trả lời vô dụng.
+
+**Kết quả: 3 lượt liên tiếp 6/6 (18/18). 81 unit test PASS.**
+
+---
+
+## 24-09-2026 — Agent hỏi-đáp chạy được, và hai lần nó suýt nói dối một cách thuyết phục
+
+Xong tầng semantic (`semantic/`) + agent LangGraph (`agent/`), chạy trên DeepSeek.
+**67 unit test PASS**, `ruff check .` sạch, `pytest` không tham số (đúng như CI) xanh.
+
+### Kiến trúc và những chỗ được THI HÀNH thay vì khuyến nghị
+
+```
+câu hỏi -> agent (LLM chọn tool) -> tools -> agent -> verify -> câu trả lời
+```
+
+| Tầng | Chặn được gì |
+|---|---|
+| `metrics.yml` | ratio khai numerator/denominator RỜI NHAU -> không có đường viết `avg(tỷ_lệ)` |
+| `layer.py` | filter tử số vào CASE WHEN (vào WHERE là success_rate thành 100% mọi lát cắt) · `cast as numeric` (Postgres chia nguyên biến 0,72 thành 0) · cấm ghép 2 nguồn (nhân đôi tiền) · watermark đi kèm MỌI truy vấn |
+| `query.py` | kết nối bằng **`marts_ro`** — không ghi được, không thấy dữ liệu thô. Ràng buộc HẠ TẦNG, không phải câu dặn trong prompt |
+| `tools.py` | LMDI (số dư = 0 theo định nghĩa) · HHI thang DOJ · DiD + median/MAD |
+| `verify.py` | đối chiếu TỪNG con số trong câu trả lời ngược về kết quả tool |
+
+Agent **không có tool nào nhận SQL**. Nó chọn tool và điền tham số.
+
+### Chấm điểm: tìm ra sự cố #3 mà không được gợi ý
+
+Hỏi *"tháng 8 các kênh có gì bất thường không?"* → agent gọi `list_metrics` →
+`detect_divergence` ×3 → `compare_periods` → `get_metric`, rồi trả lời: chỉ ONLINE
+lệch (z = −17,9), diễn biến 91,2% → 54,6% rồi hồi phục, cửa sổ **05–14/08** — khớp
+cửa sổ thiết kế. **54 số khớp · 14 suy ra · 0 chưa truy được.**
+
+### 🔴 Lần 1 nó nói dối: "BRANCH rơi 50,9%, đáng điều tra"
+
+Hỏi về một tuần YÊN TĨNH. Agent báo BRANCH sụt 50,9%, DiD `significant = true`,
+robust_z = −8,44. Nó còn **đọc cảnh báo chu kỳ tháng rồi lập luận vượt qua nó**:
+*"chu kỳ tháng không giải thích được toàn bộ mức giảm"*.
+
+Kiểm nguồn: ngày 01/09 có **16.257 khoản lương trị giá 122.068.741, toàn bộ qua kênh
+BRANCH**. Mức "rơi 136M" chính là khoản lương đó. Không có sự cố nào cả.
+
+**DiD đúng về toán** — BRANCH thật sự lệch khỏi các kênh khác. Nhưng giả định nền của
+DiD là *"xu hướng song song"*, và giả định đó VỠ khi một nhóm có nhịp riêng vì lý do
+cấu trúc. Đây chính là cái bẫy multiple-comparisons đã nêu từ đầu, và nó xảy ra thật.
+
+**Sửa: kiểm định giả dược** — chạy lại đúng phép so đó ở một chu kỳ trước (dịch một
+tháng lịch, giữ nguyên ngày trong tháng). Nhóm nào đổi y hệt trong cửa sổ giả dược thì
+đó là NHỊP, không phải sự cố; bỏ cờ và nói rõ lý do.
+
+⚠️ **Lần cài đầu vẫn sai**: tôi so `did` của cửa sổ giả dược. Nhưng DiD đi qua nhóm đối
+chứng, mà cửa sổ giả dược (tháng 8) lại **trùng đợt hỏng kênh ONLINE** → DiD của BRANCH
+đổi dấu, kiểm định vô hiệu. Câu hỏi *"nhóm này có nhịp riêng không"* là câu hỏi VỀ
+CHÍNH NÓ. Đổi sang so `own_change` thì đúng cả hai ca:
+
+```
+CA GIẢ   BRANCH  tự đổi -1,445e+08 ở tháng trước vs -1,362e+08 nay  -> BỎ CỜ
+CA THẬT  ONLINE  tự đổi -0,2522 nay vs -0,0009 giả dược             -> GIỮ CỜ
+```
+
+Hỏi lại cùng câu: *"Vì vậy tôi không thể kết luận đây là suy giảm thật... BRANCH đã
+giảm y hệt cùng kỳ tháng trước — nhịp chu kỳ, không phải sự cố mới."*
+
+### 🔴 Lần 2 nó suýt nói dối: chính bộ kiểm số không kiểm gì cả
+
+`verify.py` để `ABS_TOL = 0.5`. Với tỷ lệ (miền 0..1) thì sai số cho phép **rộng hơn cả
+miền giá trị**, nên MỌI tỷ lệ bịa đều "khớp" — bộ gác báo *sạch* trong khi không gác gì.
+Tệ hơn là không có bộ gác, vì nó tạo cảm giác an toàn. Hạ xuống `0.005`, so theo ĐỘ LỚN
+(dấu do chữ mang: "mất 54 triệu" = "−54 triệu").
+
+Lỗi phụ cùng file: `08–14/09` sinh ra ba "con số" không truy về đâu được. Cảnh báo bắn
+oan nhiều lần thì cảnh báo đúng cũng mất tác dụng → xoá mẫu ngày trước khi dò số.
+
+### Ba mức nhãn, không chặn cứng
+
+`verified` (khớp fact) · `derived` (khớp hiệu hai fact — mô hình được phép tự trừ) ·
+`unverified` (nghi bịa, nêu THẲNG cho người đọc). Chặn cứng nghe nghiêm khắc hơn nhưng
+sai: nó chỉ khiến người dùng hỏi lại cùng câu đó tới khi may mắn qua được.
+
+### Hạ tầng
+
+Venv **riêng** `~/working/gtl-agent-venv` + `requirements-agent.txt` ghim cứng (đã thử
+dựng lại từ đầu, exit 0). Không nhét langchain vào `gtl-spark-venv` đang chạy pyspark
+3.5.0 + dbt — hỏng ở đó là mất cả đường ống, không chỉ mất chatbot.
+`.env.example` + `DEEPSEEK_API_KEY`; `PyYAML` khai tường minh trong `requirements.txt`
+(trước đó chỉ có nhờ dbt tình cờ kéo về).
+
+---
+
 ## 23-09-2026 — Tầng phục vụ cho agent: một khối rộng, và hai chỗ nguồn nói dối
 
 Mục tiêu: dựng marts để agent hỏi-đáp truy vấn được. Xong 8 thay đổi, chạy thật, và
